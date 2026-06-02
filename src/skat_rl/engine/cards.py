@@ -88,4 +88,11 @@ def sort_cards(cards):
         Rank.EIGHT: 6,
         Rank.SEVEN: 7,
     }
-    return sorted(cards, key=lambda c: (card_suit(c), rank_order[card_rank(c)]))
+    return sorted(
+        cards,
+        key=lambda card: (
+            card_rank(card) != Rank.JACK,
+            card_suit(card),
+            rank_order[card_rank(card)],
+        ),
+    )
