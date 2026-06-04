@@ -129,12 +129,12 @@ def trick_points(trick):
     return sum(card_points(card) for _, card in trick.cards)
 
 
-def declarer_points(won_cards, declarer):
-    return sum(card_points(card) for card in won_cards[declarer])
-
-
 def declarer_took_trick(trick_winners, declarer):
     return any(winner == declarer for winner in trick_winners)
+
+
+def points_won_by_player(won_cards, player):
+    return sum(card_points(card) for card in won_cards[player])
 
 
 def game_result(won_cards, trick_winners, declarer, game_type):
@@ -150,7 +150,7 @@ def game_result(won_cards, trick_winners, declarer, game_type):
             "schwarz": declarer_won,
         }
 
-    dec_points = declarer_points(won_cards, declarer)
+    dec_points = points_won_by_player(won_cards, declarer)
     def_points = 120 - dec_points
 
     declarer_won = dec_points > 60

@@ -16,8 +16,10 @@ dependencies = [
 
 [project.optional-dependencies]
 training = [
+    "rich>=10.0",
     "sb3-contrib>=2.0",
     "stable-baselines3>=2.0",
+    "tqdm>=4.0",
 ]
 
 [tool.setuptools.packages.find]
