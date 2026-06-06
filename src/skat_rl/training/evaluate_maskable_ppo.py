@@ -1,5 +1,7 @@
 # src/skat_rl/training/evaluate_maskable_ppo.py
 
+import argparse
+
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 
@@ -94,8 +96,12 @@ def evaluate(model_path, n_games=1000):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--timestamp", required=True)
+    args = parser.parse_args()
+
     evaluate(
-        model_path="models/maskable_ppo_skat_player0",
+        model_path=f"models/maskable_ppo_skat_player0_{args.timestamp}/model.zip",
         n_games=1000,
     )
 
