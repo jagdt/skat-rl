@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -16,35 +17,58 @@ def main():
     output_dir = Path("models") / f"maskable_ppo_skat_player0_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "model.zip"
+    total_timesteps = 500_000
+    env_config = {
+        "learning_player": 0,
+        "seed": 42,
+    }
+    model_config = {
+        "policy": "MlpPolicy",
+        "policy_kwargs":dict(net_arch=dict(pi=[512, 256, 256],vf=[512, 256, 256])),
+        "verbose": 1,
+        "learning_rate": 3e-4,
+        "n_steps": 8192,
+        "batch_size": 256,
+        "gamma": 0.99,
+        "gae_lambda": 0.95,
+        "clip_range": 0.2,
+        "ent_coef": 0.01,
+    }
 
-    env = SkatSingleAgentEnv(
-        learning_player=0,
-        seed=42,
-    )
+    _save_config(output_dir, timestamp, total_timesteps, env_config, model_config)
+
+    env = SkatSingleAgentEnv(**env_config)
 
     env = Monitor(env)
 
     model = MaskablePPO(
-        policy="MlpPolicy",
         env=env,
-        verbose=1,
-        learning_rate=3e-4,
-        n_steps=8192,
-        batch_size=256,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
+        **model_config,
     )
 
     model.learn(
-        total_timesteps=1_000_000,
+        total_timesteps=total_timesteps,
         progress_bar=True,
     )
 
     model.save(model_path)
     _save_training_history(env, output_dir)
     print(f"Saved training run to {output_dir}")
+
+
+def _save_config(output_dir, timestamp, total_timesteps, env_config, model_config):
+    config = {
+        "timestamp": timestamp,
+        "total_timesteps": total_timesteps,
+        "environment": env_config,
+        "model": model_config,
+    }
+    config_path = output_dir / "config.json"
+
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2)
+
+    print(f"Saved training config to {config_path}")
 
 
 def _save_training_history(env, output_dir):
