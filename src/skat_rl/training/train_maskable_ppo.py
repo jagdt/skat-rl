@@ -29,8 +29,8 @@ def main():
         env=env,
         verbose=1,
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
+        n_steps=8192,
+        batch_size=256,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
@@ -38,7 +38,7 @@ def main():
     )
 
     model.learn(
-        total_timesteps=500_000,
+        total_timesteps=1_000_000,
         progress_bar=True,
     )
 
