@@ -46,7 +46,7 @@ class SkatSingleAgentEnv(gym.Env):
             opponent_agents = [
                 None,
                 HeuristicAgent(),
-                RandomAgent(),
+                HeuristicAgent(),
             ]
 
         self.opponent_agents = opponent_agents
@@ -76,12 +76,10 @@ class SkatSingleAgentEnv(gym.Env):
         super().reset(seed=seed)
 
         if seed is not None:
-            self.seed_value = seed
+            self.game.reset(seed=seed)
+        else:
+            self.game.reset()
 
-        self.game.reset(seed=self.seed_value)
-
-        # If another player starts, let heuristic opponents play until it is
-        # the learning player's turn or the game ends.
         self._play_until_learning_player()
 
         observation = self._get_observation()
