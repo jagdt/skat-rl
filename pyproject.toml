@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 training = [
+    "matplotlib>=3.7",
     "rich>=10.0",
     "sb3-contrib>=2.0",
     "stable-baselines3>=2.0",

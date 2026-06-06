@@ -45,7 +45,7 @@ class SkatSingleAgentEnv(gym.Env):
         if opponent_agents is None:
             opponent_agents = [
                 None,
-                RandomAgent(),
+                HeuristicAgent(),
                 RandomAgent(),
             ]
 

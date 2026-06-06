@@ -21,6 +21,8 @@ def evaluate(model_path, n_games=1000):
     defender_games = 0
     declarer_wins = 0
     defender_wins = 0
+    declarer_games_by_player = [0, 0, 0]
+    declarer_wins_by_player = [0, 0, 0]
 
     for game_idx in range(n_games):
         obs, info = env.reset(seed=game_idx)
@@ -51,6 +53,11 @@ def evaluate(model_path, n_games=1000):
 
         games_finished += 1
         total_reward += episode_reward
+        declarer = result["declarer"]
+        declarer_games_by_player[declarer] += 1
+
+        if result["declarer_won"]:
+            declarer_wins_by_player[declarer] += 1
 
         player_won = False
 
@@ -69,8 +76,6 @@ def evaluate(model_path, n_games=1000):
             wins += 1
 
     print(f"Games evaluated: {games_finished}")
-    print(f"Player 0 total win rate: {wins / games_finished:.3f}")
-    print(f"Average episode reward: {total_reward / games_finished:.3f}")
 
     if declarer_games > 0:
         print(f"Player 0 declarer games: {declarer_games}")
@@ -79,6 +84,13 @@ def evaluate(model_path, n_games=1000):
     if defender_games > 0:
         print(f"Player 0 defender games: {defender_games}")
         print(f"Player 0 defender win rate: {defender_wins / defender_games:.3f}")
+
+    for player in (1, 2):
+        games = declarer_games_by_player[player]
+        if games > 0:
+            win_rate = declarer_wins_by_player[player] / games
+            print(f"Player {player} declarer games: {games}")
+            print(f"Player {player} declarer win rate: {win_rate:.3f}")
 
 
 def main():
