@@ -200,19 +200,18 @@ class SkatGame:
     def _terminal_reward(self, result):
         declarer = result["declarer"]
         declarer_won = result["declarer_won"]
+        declarer_points = result["declarer_points"]
 
         reward = [0.0, 0.0, 0.0]
 
         if declarer_won:
-            reward[declarer] = 1.0
-            for player in range(3):
-                if player != declarer:
-                    reward[player] = -0.5
+            reward[declarer] = 1.0 + 0.2 * (declarer_points - 60) / 60.0
         else:
-            reward[declarer] = -1.0
-            for player in range(3):
-                if player != declarer:
-                    reward[player] = 0.5
+            reward[declarer] = -1.0 - 0.2 * (60 - declarer_points) / 60.0
+
+        for player in range(3):
+            if player != declarer:
+                reward[player] = -reward[declarer] / 2.0
 
         return reward
 
