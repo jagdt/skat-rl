@@ -4,7 +4,7 @@ from gymnasium import spaces
 
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.state import GameKind
-from skat_rl.engine.rules import points_won_by_player
+from skat_rl.engine.rules import effective_suit, points_won_by_player
 from skat_rl.agents.heuristic_agent import HeuristicAgent
 from skat_rl.agents.random_agent import RandomAgent
 
@@ -22,14 +22,17 @@ class SkatSingleAgentEnv(gym.Env):
     Observation:
         A flat vector containing:
         - own hand
-        - played cards
+        - ordered history cards
+        - ordered history players
         - current trick cards
         - current player one-hot
+        - current trick leader one-hot
         - declarer one-hot
-        - role flag
         - game type/trump encoding
-        - trick progress
-        - current points won per player
+        - trick number
+        - current trick position
+        - current declarer and defender points
+        - void information
     """
 
     metadata = {"render_modes": ["human"]}
@@ -53,17 +56,21 @@ class SkatSingleAgentEnv(gym.Env):
 
         self.action_space = spaces.Discrete(32)
 
-        # Observation length:
-        # own hand: 32
-        # played cards: 32
-        # current trick cards: 32
-        # current player one-hot: 3
-        # declarer one-hot: 3
-        # game kind: 3
-        # trump suit: 4
-        # trick number normalized: 1
-        # points won by players normalized: 3
-        obs_dim = 32 + 32 + 32 + 3 + 3 + 3 + 4 + 1 + 3
+        obs_dim = (
+            32              # own hand
+            + 10 * 3 * 32   # history cards
+            + 10 * 3 * 3    # history players
+            + 32             # current trick cards
+            + 3             # current player
+            + 3             # current trick leader
+            + 3             # declarer
+            + 3             # game kind
+            + 4             # trump suit
+            + 1             # trick number
+            + 1             # current trick position
+            + 2             # declarer and defender points
+            + 3 * 5         # void info
+        )
 
         self.observation_space = spaces.Box(
             low=0.0,
@@ -196,13 +203,16 @@ class SkatSingleAgentEnv(gym.Env):
         for card in state.hands[player]:
             own_hand[card] = 1.0
 
-        played_cards = np.zeros(32, dtype=np.float32)
-        for trick in state.completed_tricks:
-            for _, card in trick.cards:
-                played_cards[card] = 1.0
+        history_cards = np.zeros((10, 3, 32), dtype=np.float32)
+        history_players = np.zeros((10, 3, 3), dtype=np.float32)
+        tricks = list(state.completed_tricks)
+        if not state.current_trick.is_complete():
+            tricks.append(state.current_trick)
 
-        for _, card in state.current_trick.cards:
-            played_cards[card] = 1.0
+        for trick_index, trick in enumerate(tricks[:10]):
+            for slot_index, (card_player, card) in enumerate(trick.cards[:3]):
+                history_cards[trick_index, slot_index, card] = 1.0
+                history_players[trick_index, slot_index, card_player] = 1.0
 
         current_trick = np.zeros(32, dtype=np.float32)
         for _, card in state.current_trick.cards:
@@ -210,6 +220,9 @@ class SkatSingleAgentEnv(gym.Env):
 
         current_player_one_hot = np.zeros(3, dtype=np.float32)
         current_player_one_hot[state.current_player] = 1.0
+
+        current_trick_leader = np.zeros(3, dtype=np.float32)
+        current_trick_leader[state.current_trick.leader] = 1.0
 
         declarer_one_hot = np.zeros(3, dtype=np.float32)
         declarer_one_hot[state.declarer] = 1.0
@@ -231,22 +244,65 @@ class SkatSingleAgentEnv(gym.Env):
             dtype=np.float32,
         )
 
-        points = np.zeros(3, dtype=np.float32)
-        for p in range(3):
-            points[p] = points_won_by_player(state.won_cards, p) / 120.0
+        current_trick_position = np.array(
+            [len(state.current_trick.cards) / 3.0],
+            dtype=np.float32,
+        )
+
+        declarer_points = points_won_by_player(state.won_cards, state.declarer)
+        defender_points = sum(
+            points_won_by_player(state.won_cards, p)
+            for p in range(3)
+            if p != state.declarer
+        )
+        points = np.array(
+            [
+                declarer_points / 120.0,
+                defender_points / 120.0,
+            ],
+            dtype=np.float32,
+        )
+
+        void_info = self._void_info()
 
         observation = np.concatenate(
             [
                 own_hand,
-                played_cards,
+                history_cards.reshape(-1),
+                history_players.reshape(-1),
                 current_trick,
                 current_player_one_hot,
+                current_trick_leader,
                 declarer_one_hot,
                 game_kind,
                 trump_suit,
                 trick_number,
+                current_trick_position,
                 points,
+                void_info.reshape(-1),
             ]
         )
 
         return observation.astype(np.float32)
+
+    def _void_info(self):
+        state = self.game.state
+        void_info = np.zeros((3, 5), dtype=np.float32)
+
+        for trick in list(state.completed_tricks) + [state.current_trick]:
+            if len(trick.cards) < 2:
+                continue
+
+            required_suit = effective_suit(trick.lead_card(), state.game_type)
+            required_index = self._void_suit_index(required_suit)
+
+            for player, card in trick.cards[1:]:
+                if effective_suit(card, state.game_type) != required_suit:
+                    void_info[player, required_index] = 1.0
+
+        return void_info
+
+    def _void_suit_index(self, suit):
+        if suit == "TRUMP":
+            return 4
+        return int(suit)

@@ -74,13 +74,25 @@ def test_step_completes_trick_and_assigns_points_to_winner():
 def test_terminal_reward_marks_declarer_win_and_loss():
     game = SkatGame()
 
-    assert game._terminal_reward({"declarer": 1, "declarer_won": True}) == [
-        -0.5,
-        1.0,
-        -0.5,
+    assert game._terminal_reward(
+        {
+            "declarer": 1,
+            "declarer_won": True,
+            "declarer_points": 60,
+        }
+    ) == [
+        pytest.approx(-0.5),
+        pytest.approx(1.0),
+        pytest.approx(-0.5),
     ]
-    assert game._terminal_reward({"declarer": 1, "declarer_won": False}) == [
-        0.5,
-        -1.0,
-        0.5,
+    assert game._terminal_reward(
+        {
+            "declarer": 1,
+            "declarer_won": False,
+            "declarer_points": 60,
+        }
+    ) == [
+        pytest.approx(0.5),
+        pytest.approx(-1.0),
+        pytest.approx(0.5),
     ]
