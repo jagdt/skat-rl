@@ -1,3 +1,4 @@
+import csv
 import json
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sb3_contrib import MaskablePPO
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 
 from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
@@ -45,6 +47,7 @@ def main():
         env=env,
         **model_config,
     )
+    model.set_logger(configure(str(output_dir), ["stdout", "csv"]))
 
     model.learn(
         total_timesteps=total_timesteps,
@@ -53,6 +56,7 @@ def main():
 
     model.save(model_path)
     _save_training_history(env, output_dir)
+    _save_train_log_plots(output_dir)
     print(f"Saved training run to {output_dir}")
 
 
@@ -113,6 +117,80 @@ def _save_training_history(env, output_dir):
 
     print(f"Saved training history to {csv_path}")
     print(f"Saved training plot to {plot_path}")
+
+
+def _save_train_log_plots(output_dir):
+    log_path = output_dir / "progress.csv"
+    plot_path = output_dir / "train_logs.png"
+
+    if not log_path.exists():
+        return
+
+    train_metrics = [
+        "train/approx_kl",
+        "train/clip_fraction",
+        "train/clip_range",
+        "train/entropy_loss",
+        "train/explained_variance",
+        "train/learning_rate",
+        "train/loss",
+        "train/n_updates",
+        "train/policy_gradient_loss",
+        "train/value_loss",
+    ]
+    metric_values = {
+        metric: {"x": [], "y": []}
+        for metric in train_metrics
+    }
+
+    with open(log_path, "r", encoding="utf-8") as log_file:
+        reader = csv.DictReader(log_file)
+        for row_index, row in enumerate(reader, start=1):
+            x_value = _parse_float(row.get("time/total_timesteps"), row_index)
+            for metric in train_metrics:
+                value = _parse_float(row.get(metric))
+                if value is not None:
+                    metric_values[metric]["x"].append(x_value)
+                    metric_values[metric]["y"].append(value)
+
+    metric_values = {
+        metric: values
+        for metric, values in metric_values.items()
+        if values["y"]
+    }
+    if not metric_values:
+        return
+
+    n_cols = 2
+    n_rows = (len(metric_values) + n_cols - 1) // n_cols
+    fig, _ = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), squeeze=False)
+
+    for ax, (metric, values) in zip(fig.axes, metric_values.items()):
+        ax.plot(values["x"], values["y"], linewidth=1.8)
+        ax.set_title(metric.replace("train/", ""))
+        ax.set_xlabel("Timesteps")
+        ax.grid(True, alpha=0.3)
+
+    for ax in fig.axes[len(metric_values):]:
+        ax.remove()
+
+    fig.suptitle("Maskable PPO Train Logs")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved train logs to {log_path}")
+    print(f"Saved train log plot to {plot_path}")
+
+
+def _parse_float(value, default=None):
+    if value in (None, ""):
+        return default
+
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _rolling_average(values, window):
