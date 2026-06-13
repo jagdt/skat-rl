@@ -22,6 +22,7 @@ def main():
     total_timesteps = 500_000
     env_config = {
         "learning_player": 0,
+        "fixed_declarer": 0,
         "seed": 42,
     }
     model_config = {

@@ -14,36 +14,48 @@ class StepResult:
 
 
 class SkatGame:
-    def __init__(self, game_type=None, declarer=0, seed=None):
+    def __init__(self, game_type=None, declarer=0, fixed_declarer=None, seed=None):
+        if fixed_declarer is not None and fixed_declarer not in range(3):
+            raise ValueError("fixed_declarer must be 0, 1, 2, or None.")
+
         self.rng = random.Random(seed)
         self.default_game_type = game_type or GameType(GameKind.GRAND)
         self.default_declarer = declarer
+        self.fixed_declarer = fixed_declarer
         self.state = None
 
     def reset(self, game_type=None, declarer=None, seed=None):
         if seed is not None:
             self.rng.seed(seed)
 
-        deck = full_deck()
-        self.rng.shuffle(deck)
+        while True:
+            deck = full_deck()
+            self.rng.shuffle(deck)
 
-        hands = [
-            set(deck[0:10]),
-            set(deck[10:20]),
-            set(deck[20:30]),
-        ]
+            hands = [
+                set(deck[0:10]),
+                set(deck[10:20]),
+                set(deck[20:30]),
+            ]
+
+            if (
+                declarer is not None
+                or self.fixed_declarer is None
+                or self._choose_declarer(hands) == self.fixed_declarer
+            ):
+                break
 
         skat = deck[30:32]
 
         if declarer is None:
-            declarer = self._choose_declarer(hands)
+            if self.fixed_declarer is not None:
+                declarer = self.fixed_declarer
+            else:
+                declarer = self._choose_declarer(hands)
 
         if game_type is None:
             trump_suit = self._choose_trump_suit(hands[declarer])
             game_type = GameType(GameKind.SUIT, trump_suit=trump_suit)
-
-        if declarer is None:
-            declarer = self.default_declarer
 
         if game_type is None:
             game_type = self.default_game_type

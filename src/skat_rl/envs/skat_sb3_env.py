@@ -37,13 +37,14 @@ class SkatSingleAgentEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, learning_player=0, opponent_agents=None, seed=None):
+    def __init__(self, learning_player=0, opponent_agents=None, fixed_declarer=None, seed=None):
         super().__init__()
 
         self.learning_player = learning_player
         self.seed_value = seed
+        self.fixed_declarer = fixed_declarer
 
-        self.game = SkatGame(seed=seed)
+        self.game = SkatGame(fixed_declarer=self.fixed_declarer, seed=seed)
 
         if opponent_agents is None:
             opponent_agents = [

@@ -10,9 +10,19 @@ def test_observation_matches_new_vector_shape():
     env = SkatSingleAgentEnv(learning_player=0, seed=1)
     observation, _ = env.reset(seed=1)
 
+    assert env.game.state.declarer == 0
+    assert env.game._choose_declarer(env.game.state.hands) == 0
     assert observation.shape == env.observation_space.shape
     assert observation.shape == (1149,)
     assert observation.dtype == np.float32
+
+
+def test_nonzero_learning_player_is_fixed_declarer():
+    env = SkatSingleAgentEnv(learning_player=2, seed=1)
+    env.reset(seed=1)
+
+    assert env.game.state.declarer == 2
+    assert env.game._choose_declarer(env.game.state.hands) == 2
 
 
 def test_observation_encodes_ordered_history_current_trick_and_void_info():

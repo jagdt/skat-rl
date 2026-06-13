@@ -18,6 +18,20 @@ def test_reset_deals_all_cards_and_initializes_state():
     assert not state.terminated
 
 
+def test_reset_reshuffles_until_fixed_player_is_chosen_as_declarer():
+    game = SkatGame(fixed_declarer=2, seed=1)
+    state = game.reset(seed=1)
+
+    assert state.declarer == 2
+    assert game._choose_declarer(state.hands) == 2
+    assert set().union(*state.hands, set(state.skat)) == set(full_deck())
+
+
+def test_fixed_declarer_must_be_valid_player():
+    with pytest.raises(ValueError, match="fixed_declarer"):
+        SkatGame(fixed_declarer=3)
+
+
 def test_observe_and_legal_actions_require_reset():
     game = SkatGame()
 
