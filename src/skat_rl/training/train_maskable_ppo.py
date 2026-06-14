@@ -1,3 +1,4 @@
+import argparse
 import csv
 import json
 from datetime import datetime
@@ -15,6 +16,10 @@ from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
 
 
 def main():
+    args = _parse_args()
+    initial_model_path = _model_path(args.initial_model, "Initial")
+    continue_model_path = _model_path(args.continue_model, "Continue")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path("models") / f"maskable_ppo_skat_player0_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -27,32 +32,50 @@ def main():
     }
     model_config = {
         "policy": "MlpPolicy",
-        "policy_kwargs":dict(net_arch=dict(pi=[512, 256, 256],vf=[512, 256, 256])),
+        "policy_kwargs":dict(net_arch=dict(pi=[512, 512, 512, 512, 512, 512, 512, 512],vf=[512, 512, 512, 512, 512, 512, 512, 512])),
         "verbose": 1,
         "learning_rate": 3e-4,
-        "n_steps": 8192,
-        "batch_size": 256,
+        "n_steps": 819200,
+        "batch_size": 25600,
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "clip_range": 0.2,
         "ent_coef": 0.01,
     }
 
-    _save_config(output_dir, timestamp, total_timesteps, env_config, model_config)
+    _save_config(
+        output_dir,
+        timestamp,
+        total_timesteps,
+        env_config,
+        model_config,
+        initial_model_path,
+        continue_model_path,
+    )
 
     env = SkatSingleAgentEnv(**env_config)
 
     env = Monitor(env)
 
-    model = MaskablePPO(
-        env=env,
-        **model_config,
-    )
+    if continue_model_path is not None:
+        model = MaskablePPO.load(continue_model_path, env=env)
+        reset_num_timesteps = False
+        print(f"Continuing full training state from {continue_model_path}")
+    else:
+        model = MaskablePPO(
+            env=env,
+            **model_config,
+        )
+        if initial_model_path is not None:
+            _load_policy_weights(model, initial_model_path)
+        reset_num_timesteps = True
+
     model.set_logger(configure(str(output_dir), ["stdout", "csv"]))
 
     model.learn(
         total_timesteps=total_timesteps,
         progress_bar=True,
+        reset_num_timesteps=reset_num_timesteps,
     )
 
     model.save(model_path)
@@ -61,10 +84,68 @@ def main():
     print(f"Saved training run to {output_dir}")
 
 
-def _save_config(output_dir, timestamp, total_timesteps, env_config, model_config):
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument(
+        "--initial-model",
+        help="Path to a model.zip whose neural-network weights initialize the new model.",
+    )
+    model_group.add_argument(
+        "--continue-model",
+        help="Path to a model.zip whose full PPO training state should be continued.",
+    )
+    return parser.parse_args()
+
+
+def _model_path(path, label):
+    if path is None:
+        return None
+
+    model_path = Path(path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"{label} model not found: {model_path}")
+    return model_path
+
+
+def _load_policy_weights(model, model_path):
+    initial_model = MaskablePPO.load(model_path, device=model.device)
+
+    try:
+        model.policy.load_state_dict(initial_model.policy.state_dict())
+    except RuntimeError as error:
+        raise ValueError(
+            "The initial model's neural-network architecture or observation "
+            "space is incompatible with the current model configuration."
+        ) from error
+
+    print(f"Loaded neural-network weights from {model_path}")
+
+
+def _save_config(
+    output_dir,
+    timestamp,
+    total_timesteps,
+    env_config,
+    model_config,
+    initial_model_path,
+    continue_model_path,
+):
+    if continue_model_path is not None:
+        training_mode = "continue"
+        source_model = continue_model_path
+    elif initial_model_path is not None:
+        training_mode = "initialize_weights"
+        source_model = initial_model_path
+    else:
+        training_mode = "new"
+        source_model = None
+
     config = {
         "timestamp": timestamp,
         "total_timesteps": total_timesteps,
+        "training_mode": training_mode,
+        "source_model": str(source_model) if source_model is not None else None,
         "environment": env_config,
         "model": model_config,
     }
