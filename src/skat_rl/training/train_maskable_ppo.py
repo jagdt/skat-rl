@@ -1,8 +1,11 @@
 import argparse
 import csv
 import json
+import os
 from datetime import datetime
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib
 
@@ -11,13 +14,18 @@ import matplotlib.pyplot as plt
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
 from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
+
+SEED_SPACING = 100_000_000
 
 
 def main():
     args = _parse_args()
+    if args.n_envs < 1:
+        raise ValueError("--n-envs must be at least 1")
+
     initial_model_path = _model_path(args.initial_model, "Initial")
     continue_model_path = _model_path(args.continue_model, "Continue")
 
@@ -50,38 +58,41 @@ def main():
         total_timesteps,
         env_config,
         model_config,
+        args.n_envs,
         initial_model_path,
         continue_model_path,
     )
 
-    env = SkatCppSingleAgentEnv(**env_config)
+    env = _make_vec_env(env_config, args.n_envs)
 
-    env = Monitor(env)
+    try:
+        if continue_model_path is not None:
+            model = MaskablePPO.load(continue_model_path, env=env)
+            reset_num_timesteps = False
+            print(f"Continuing full training state from {continue_model_path}")
+        else:
+            model = MaskablePPO(
+                env=env,
+                **model_config,
+            )
+            if initial_model_path is not None:
+                _load_policy_weights(model, initial_model_path)
+            reset_num_timesteps = True
 
-    if continue_model_path is not None:
-        model = MaskablePPO.load(continue_model_path, env=env)
-        reset_num_timesteps = False
-        print(f"Continuing full training state from {continue_model_path}")
-    else:
-        model = MaskablePPO(
-            env=env,
-            **model_config,
+        model.set_logger(configure(str(output_dir), ["stdout", "csv"]))
+
+        model.learn(
+            total_timesteps=total_timesteps,
+            progress_bar=True,
+            reset_num_timesteps=reset_num_timesteps,
         )
-        if initial_model_path is not None:
-            _load_policy_weights(model, initial_model_path)
-        reset_num_timesteps = True
 
-    model.set_logger(configure(str(output_dir), ["stdout", "csv"]))
+        model.save(model_path)
+        _save_training_history(env, output_dir)
+        _save_train_log_plots(output_dir)
+    finally:
+        env.close()
 
-    model.learn(
-        total_timesteps=total_timesteps,
-        progress_bar=True,
-        reset_num_timesteps=reset_num_timesteps,
-    )
-
-    model.save(model_path)
-    _save_training_history(env, output_dir)
-    _save_train_log_plots(output_dir)
     print(f"Saved training run to {output_dir}")
 
 
@@ -96,7 +107,34 @@ def _parse_args():
         "--continue-model",
         help="Path to a model.zip whose full PPO training state should be continued.",
     )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=6,
+        help="Number of parallel training environments to run with SubprocVecEnv.",
+    )
     return parser.parse_args()
+
+
+def _make_vec_env(env_config, n_envs):
+    env_fns = [
+        _make_env(env_config, env_index)
+        for env_index in range(n_envs)
+    ]
+    return SubprocVecEnv(env_fns, start_method="fork")
+
+
+def _make_env(env_config, env_index):
+    def _init():
+        config = dict(env_config)
+        seed = config.get("seed")
+        if seed is not None:
+            config["seed"] = seed + env_index * SEED_SPACING
+
+
+        return Monitor(SkatCppSingleAgentEnv(**config))
+
+    return _init
 
 
 def _model_path(path, label):
@@ -129,6 +167,7 @@ def _save_config(
     total_timesteps,
     env_config,
     model_config,
+    n_envs,
     initial_model_path,
     continue_model_path,
 ):
@@ -147,6 +186,7 @@ def _save_config(
         "total_timesteps": total_timesteps,
         "training_mode": training_mode,
         "source_model": str(source_model) if source_model is not None else None,
+        "n_envs": n_envs,
         "environment": env_config,
         "model": model_config,
     }
@@ -159,25 +199,24 @@ def _save_config(
 
 
 def _save_training_history(env, output_dir):
-    rewards = env.get_episode_rewards()
-    lengths = env.get_episode_lengths()
-    times = env.get_episode_times()
+    histories = _monitor_histories(env)
 
-    if not rewards:
+    if not histories:
         return
 
     csv_path = output_dir / "history.csv"
     plot_path = output_dir / "training.png"
 
     with open(csv_path, "w", encoding="utf-8") as history_file:
-        history_file.write("episode,reward,length,time_seconds\n")
-        for episode, (reward, length, elapsed) in enumerate(
-            zip(rewards, lengths, times),
-            start=1,
-        ):
-            history_file.write(f"{episode},{reward},{length},{elapsed}\n")
+        history_file.write("episode,env_index,env_episode,reward,length,time_seconds\n")
+        for episode, history in enumerate(histories, start=1):
+            history_file.write(
+                f"{episode},{history['env_index']},{history['env_episode']},"
+                f"{history['reward']},{history['length']},{history['time_seconds']}\n"
+            )
 
-    episodes = list(range(1, len(rewards) + 1))
+    rewards = [history["reward"] for history in histories]
+    episodes = list(range(1, len(histories) + 1))
     rolling_rewards = _rolling_average(rewards, window=100)
 
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -200,6 +239,38 @@ def _save_training_history(env, output_dir):
 
     print(f"Saved training history to {csv_path}")
     print(f"Saved training plot to {plot_path}")
+
+
+def _monitor_histories(env):
+    if hasattr(env, "env_method"):
+        rewards_by_env = env.env_method("get_episode_rewards")
+        lengths_by_env = env.env_method("get_episode_lengths")
+        times_by_env = env.env_method("get_episode_times")
+    else:
+        rewards_by_env = [env.get_episode_rewards()]
+        lengths_by_env = [env.get_episode_lengths()]
+        times_by_env = [env.get_episode_times()]
+
+    histories = []
+    for env_index, (rewards, lengths, times) in enumerate(
+        zip(rewards_by_env, lengths_by_env, times_by_env)
+    ):
+        for env_episode, (reward, length, elapsed) in enumerate(
+            zip(rewards, lengths, times),
+            start=1,
+        ):
+            histories.append(
+                {
+                    "env_index": env_index,
+                    "env_episode": env_episode,
+                    "reward": reward,
+                    "length": length,
+                    "time_seconds": elapsed,
+                }
+            )
+
+    histories.sort(key=lambda history: history["time_seconds"])
+    return histories
 
 
 def _save_train_log_plots(output_dir):
