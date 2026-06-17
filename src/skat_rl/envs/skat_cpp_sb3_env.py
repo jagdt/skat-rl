@@ -45,6 +45,7 @@ class SkatCppSingleAgentEnv(gym.Env):
         reset_seed = self.seed_value if seed is None else seed
         if reset_seed is None:
             reset_seed = 0
+        self.seed_value = int(reset_seed) + 1
 
         if self.fixed_declarer is None:
             self.game.reset(int(reset_seed))
