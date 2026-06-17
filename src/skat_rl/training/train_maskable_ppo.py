@@ -13,6 +13,7 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 
 from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
+from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
 
 
 def main():
@@ -24,7 +25,7 @@ def main():
     output_dir = Path("models") / f"maskable_ppo_skat_player0_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "model.zip"
-    total_timesteps = 500_000
+    total_timesteps = 5_000_000
     env_config = {
         "learning_player": 0,
         "fixed_declarer": 0,
@@ -53,7 +54,7 @@ def main():
         continue_model_path,
     )
 
-    env = SkatSingleAgentEnv(**env_config)
+    env = SkatCppSingleAgentEnv(**env_config)
 
     env = Monitor(env)
 

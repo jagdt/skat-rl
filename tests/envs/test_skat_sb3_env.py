@@ -7,7 +7,7 @@ from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
 
 
 def test_observation_matches_new_vector_shape():
-    env = SkatSingleAgentEnv(learning_player=0, seed=1)
+    env = SkatSingleAgentEnv(learning_player=0, fixed_declarer=0, seed=1)
     observation, _ = env.reset(seed=1)
 
     assert env.game.state.declarer == 0
@@ -18,7 +18,7 @@ def test_observation_matches_new_vector_shape():
 
 
 def test_nonzero_learning_player_is_fixed_declarer():
-    env = SkatSingleAgentEnv(learning_player=2, seed=1)
+    env = SkatSingleAgentEnv(learning_player=2, fixed_declarer=2, seed=1)
     env.reset(seed=1)
 
     assert env.game.state.declarer == 2
