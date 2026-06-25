@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skat-rl"
+version = "0.1.0"
+description = "Skat reinforcement-learning environments, agents, and training scripts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "gymnasium>=0.29",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+training = [
+    "matplotlib>=3.7",
+    "rich>=10.0",
+    "sb3-contrib>=2.0",
+    "stable-baselines3>=2.0",
+    "tqdm>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
