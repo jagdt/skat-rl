@@ -18,6 +18,10 @@ Install the required packages:
 pip install -e .
 ```
 
+Run training:
+```bash
+python -m skat_rl.training.train_maskable_ppo
+```
 
 ## Outlook
 

@@ -16,7 +16,8 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
+# from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
+from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
 
 SEED_SPACING = 100_000_000
 
@@ -132,7 +133,7 @@ def _make_env(env_config, env_index):
             config["seed"] = seed + env_index * SEED_SPACING
 
 
-        return Monitor(SkatCppSingleAgentEnv(**config))
+        return Monitor(SkatSingleAgentEnv(**config))
 
     return _init
 
