@@ -1,6 +1,6 @@
 # Skat-RL
 
-Skat-RL is a reinforcement-learning playground for the card game Skat. The project contains a Skat engine with card/rule utilities and a random and a heuristic player. Currently, a Maskable PPO RL agent from Stable-Baselines3 is implemented, that can train and play against the random and heuristic players. 
+Skat-RL is a reinforcement-learning playground for the card game Skat. The project contains a Skat engine with card/rule utilities and random, heuristic, Stable-Baselines3 Maskable PPO, and native PyTorch PPO agents that can train and play against random and heuristic players.
 
 
 ## Setup
@@ -18,9 +18,22 @@ Install the required packages:
 pip install -e .
 ```
 
-Run training:
+Install all training dependencies, including SB3:
+
+```bash
+pip install -e ".[training]"
+```
+
+Run SB3 Maskable PPO training:
+
 ```bash
 python -m skat_rl.training.train_maskable_ppo
+```
+
+Run the from-scratch PyTorch PPO implementation:
+
+```bash
+python -m skat_rl.training.train_torch_ppo --total-timesteps 1000000 --n-envs 4
 ```
 
 ## Outlook

@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "gymnasium>=0.29",
     "numpy>=1.24",
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
