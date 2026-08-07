@@ -36,6 +36,12 @@ Run the from-scratch PyTorch PPO implementation:
 python -m skat_rl.training.train_torch_ppo --total-timesteps 1000000 --n-envs 4
 ```
 
+Plot a native PyTorch PPO run:
+
+```bash
+python -m skat_rl.training.plot_torch_ppo models/torch_ppo_skat_player0_YYYYMMDD_HHMMSS
+```
+
 ## Outlook
 
 This is an experimental project. Things that might be implemented in the future:

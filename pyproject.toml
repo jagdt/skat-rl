@@ -13,6 +13,7 @@ dependencies = [
     "gymnasium>=0.29",
     "numpy>=1.24",
     "torch>=2.0",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
