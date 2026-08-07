@@ -45,13 +45,11 @@ class SkatSingleAgentEnv(gym.Env):
         self.fixed_declarer = fixed_declarer
 
         self.game = SkatGame(fixed_declarer=self.fixed_declarer, seed=seed)
+        self._reset_void_info_cache()
 
         if opponent_agents is None:
-            opponent_agents = [
-                None,
-                HeuristicAgent(),
-                HeuristicAgent(),
-            ]
+            opponent_agents = [HeuristicAgent() for _ in range(3)]
+            opponent_agents[learning_player] = None
 
         self.opponent_agents = opponent_agents
 
@@ -88,6 +86,7 @@ class SkatSingleAgentEnv(gym.Env):
         else:
             self.game.reset()
 
+        self._reset_void_info_cache()
         self._play_until_learning_player()
 
         observation = self._get_observation()
@@ -112,6 +111,7 @@ class SkatSingleAgentEnv(gym.Env):
                 f"Illegal action {action}. Legal actions are {legal}."
             )
 
+        self._update_void_info_for_action(self.learning_player, action)
         step_result = self.game.step(action)
 
         reward = step_result.reward[self.learning_player]
@@ -186,6 +186,7 @@ class SkatSingleAgentEnv(gym.Env):
             legal = self.game.legal_actions(player)
 
             action = self.opponent_agents[player].act(obs, legal)
+            self._update_void_info_for_action(player, action)
             step_result = self.game.step(action)
 
             total_reward += step_result.reward[self.learning_player]
@@ -287,21 +288,25 @@ class SkatSingleAgentEnv(gym.Env):
         return observation.astype(np.float32)
 
     def _void_info(self):
+        return self._void_info_cache
+
+    def _reset_void_info_cache(self):
+        self._void_info_cache = np.zeros((3, 5), dtype=np.float32)
+        self._void_info_card_count = 0
+
+    def _update_void_info_for_action(self, player, action):
         state = self.game.state
-        void_info = np.zeros((3, 5), dtype=np.float32)
+        if state is None or state.terminated:
+            return
 
-        for trick in list(state.completed_tricks) + [state.current_trick]:
-            if len(trick.cards) < 2:
-                continue
-
+        trick = state.current_trick
+        if trick.cards:
             required_suit = effective_suit(trick.lead_card(), state.game_type)
             required_index = self._void_suit_index(required_suit)
 
-            for player, card in trick.cards[1:]:
-                if effective_suit(card, state.game_type) != required_suit:
-                    void_info[player, required_index] = 1.0
+            if effective_suit(action, state.game_type) != required_suit:
+                self._void_info_cache[player, required_index] = 1.0
 
-        return void_info
 
     def _void_suit_index(self, suit):
         if suit == "TRUMP":

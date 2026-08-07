@@ -52,6 +52,8 @@ def test_observation_encodes_ordered_history_current_trick_and_void_info():
     ]
     env.game.state.current_trick = Trick(leader=1, cards=[(1, diamond_ten)])
     env.game.state.current_player = 0
+    env._void_info_cache[1, int(Suit.CLUBS)] = 1.0
+    env._void_info_cache[2, int(Suit.CLUBS)] = 1.0
 
     observation = env._get_observation()
 
@@ -94,3 +96,29 @@ def test_observation_encodes_ordered_history_current_trick_and_void_info():
     void_info = observation[void_info_start:void_info_start + 15].reshape(3, 5)
     assert void_info[1, int(Suit.CLUBS)] == 1.0
     assert void_info[2, int(Suit.CLUBS)] == 1.0
+
+
+def test_void_info_cache_updates_when_player_cannot_follow_lead_suit():
+    env = SkatSingleAgentEnv(learning_player=0, seed=1)
+    env.game.reset(game_type=GameType(GameKind.GRAND), declarer=0, seed=1)
+
+    club_ace = make_card(Suit.CLUBS, Rank.ACE)
+    spade_ace = make_card(Suit.SPADES, Rank.ACE)
+    club_king = make_card(Suit.CLUBS, Rank.KING)
+
+    env.game.state.current_trick = Trick(leader=0, cards=[(0, club_ace)])
+
+    env._update_void_info_for_action(player=1, action=spade_ace)
+    env._update_void_info_for_action(player=2, action=club_king)
+
+    assert env._void_info_cache[1, int(Suit.CLUBS)] == 1.0
+    assert env._void_info_cache[2, int(Suit.CLUBS)] == 0.0
+
+
+def test_void_info_cache_resets_on_env_reset():
+    env = SkatSingleAgentEnv(learning_player=0, fixed_declarer=0, seed=1)
+    env._void_info_cache[1, int(Suit.CLUBS)] = 1.0
+
+    env.reset(seed=1)
+
+    assert not env._void_info_cache.any()
