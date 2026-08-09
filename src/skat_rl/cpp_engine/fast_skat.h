@@ -14,6 +14,21 @@ constexpr int kCardsPerHand = 10;
 constexpr int kMaxTricks = 10;
 constexpr int kTrickSize = 3;
 constexpr int kTrumpEffectiveSuit = 4;
+constexpr int kObservationDim = (
+    kNumCards
+    + kMaxTricks * kTrickSize * kNumCards
+    + kMaxTricks * kTrickSize * kNumPlayers
+    + kNumCards
+    + kNumPlayers
+    + kNumPlayers
+    + kNumPlayers
+    + 3
+    + 4
+    + 1
+    + 1
+    + 2
+    + kNumPlayers * 5
+);
 
 enum GameKind {
     SUIT = 0,
@@ -43,8 +58,8 @@ class FastSkatGame {
 public:
     FastSkatGame();
 
-    void reset(uint32_t seed);
-    void reset_fixed_declarer(uint32_t seed, int fixed_declarer);
+    void reset(uint64_t seed);
+    void reset_fixed_declarer(uint64_t seed, int fixed_declarer);
     void reset_from_deal(
         const std::vector<std::vector<int>>& hands,
         const std::vector<int>& skat,
@@ -100,6 +115,53 @@ private:
     int current_trick_winner() const;
     int current_trick_points() const;
     bool declarer_won() const;
+};
+
+struct BatchedStepInfo {
+    std::vector<int> env_indices;
+    std::vector<float> rewards;
+    std::vector<uint8_t> terminated;
+    std::vector<int> completed_env_indices;
+    std::vector<float> completed_returns;
+    std::vector<int> completed_lengths;
+};
+
+class BatchedFastSkatEnv {
+public:
+    BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer = -1);
+
+    void reset(uint64_t seed);
+    void reset_many(const std::vector<uint64_t>& seeds);
+    BatchedStepInfo step(const std::vector<int>& actions);
+    std::vector<int> active_indices() const;
+    std::vector<float> active_observations() const;
+    std::vector<uint8_t> active_action_masks() const;
+    int active_count() const;
+    int size() const;
+    int learning_player() const;
+    int observation_dim() const;
+    int action_dim() const;
+
+private:
+    std::vector<FastSkatGame> games_;
+    std::vector<uint8_t> active_;
+    std::vector<float> episode_returns_;
+    std::vector<int> episode_lengths_;
+    int learning_player_ = 0;
+    int fixed_declarer_ = -1;
+
+    float play_until_learning_player(FastSkatGame& game);
+    float reward_for_step(const FastSkatGame& game, const StepInfo& info) const;
+    int choose_opponent_action(const FastSkatGame& game) const;
+    int choose_leading_action(const FastSkatGame& game, const std::vector<int>& legal) const;
+    int choose_following_action(const FastSkatGame& game, const std::vector<int>& legal) const;
+    std::vector<int> winning_cards(const FastSkatGame& game, const std::vector<int>& legal) const;
+    int current_winning_player(const FastSkatGame& game) const;
+    int trick_value(const FastSkatGame& game) const;
+    int lowest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const;
+    int highest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const;
+    int lowest_winner(const std::vector<int>& cards, int game_kind, int trump_suit) const;
+    int trump_strength(int card, int game_kind, int trump_suit) const;
 };
 
 }  // namespace skat_rl

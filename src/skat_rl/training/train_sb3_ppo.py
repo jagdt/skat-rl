@@ -16,7 +16,6 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-# from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
 from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
 
 SEED_SPACING = 100_000_000
@@ -31,7 +30,7 @@ def main():
     continue_model_path = _model_path(args.continue_model, "Continue")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path("models") / f"maskable_ppo_skat_player0_{timestamp}"
+    output_dir = Path("models") / f"sb3_ppo_skat_player0_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / "model.zip"
     total_timesteps = 5_000_000

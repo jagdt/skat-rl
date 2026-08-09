@@ -27,13 +27,13 @@ pip install -e ".[training]"
 Run SB3 Maskable PPO training:
 
 ```bash
-python -m skat_rl.training.train_maskable_ppo
+python -m skat_rl.training.train_sb3_ppo
 ```
 
 Run the from-scratch PyTorch PPO implementation:
 
 ```bash
-python -m skat_rl.training.train_torch_ppo --total-timesteps 1000000 --n-envs 4
+python -m skat_rl.training.train_torch_ppo
 ```
 
 Plot a native PyTorch PPO run:

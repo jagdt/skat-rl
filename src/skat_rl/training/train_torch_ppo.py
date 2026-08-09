@@ -7,37 +7,46 @@ from pathlib import Path
 
 import numpy as np
 
-from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, RolloutBuffer
+from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, RolloutBatch, RolloutBuffer
 from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
-
-try:
-    from skat_rl.envs.skat_cpp_sb3_env import SkatCppSingleAgentEnv
-except ImportError:  # pragma: no cover - C++ extension is optional during development
-    SkatCppSingleAgentEnv = None
-
-
-SEED_SPACING = 100_000_000
+from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 
 def main():
     args = _parse_args()
-    if args.n_envs < 1:
-        raise ValueError("--n-envs must be at least 1")
-    if args.rollout_steps < 1:
-        raise ValueError("--rollout-steps must be at least 1")
+    if args.env == "cpp":
+        if args.rollout_size < 1:
+            raise ValueError("--rollout-size must be at least 1")
+    else:
+        if args.n_envs < 1:
+            raise ValueError("--n-envs must be at least 1")
+        if args.rollout_steps < 1:
+            raise ValueError("--rollout-steps must be at least 1")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / f"torch_ppo_skat_player{args.learning_player}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    envs = [
-        _make_env(args, env_index)
-        for env_index in range(args.n_envs)
-    ]
+    if args.env == "cpp":
+        envs = SkatCppBatchedSingleAgentEnv(
+            rollout_size=args.rollout_size,
+            learning_player=args.learning_player,
+            fixed_declarer=args.fixed_declarer,
+            seed=args.seed,
+        )
+    else:
+        envs = [
+            _make_env(args, env_index)
+            for env_index in range(args.n_envs)
+        ]
 
     try:
-        observation_dim = int(envs[0].observation_space.shape[0])
-        action_dim = int(envs[0].action_space.n)
+        if args.env == "cpp":
+            observation_dim = int(envs.observation_space.shape[0])
+            action_dim = int(envs.action_space.n)
+        else:
+            observation_dim = int(envs[0].observation_space.shape[0])
+            action_dim = int(envs[0].action_space.n)
 
         config = PPOConfig(
             observation_dim=observation_dim,
@@ -66,15 +75,21 @@ def main():
                 raise ValueError("Checkpoint observation/action dimensions do not match the env.")
 
         _save_config(output_dir, args, config)
-        _train(agent, envs, args, output_dir, global_step)
+        if args.env == "cpp":
+            _train_cpp_batched(agent, envs, args, output_dir, global_step)
+        else:
+            _train_python(agent, envs, args, output_dir, global_step)
     finally:
-        for env in envs:
-            env.close()
+        if args.env == "cpp":
+            envs.close()
+        else:
+            for env in envs:
+                env.close()
 
     print(f"Saved PyTorch PPO training run to {output_dir}")
 
 
-def _train(agent, envs, args, output_dir, global_step):
+def _train_python(agent, envs, args, output_dir, global_step):
     observations = []
     episode_returns = [0.0 for _ in envs]
     episode_lengths = [0 for _ in envs]
@@ -199,11 +214,225 @@ def _train(agent, envs, args, output_dir, global_step):
     _save_episode_history(output_dir, completed_episodes)
 
 
+def _train_cpp_batched(agent, env, args, output_dir, global_step):
+    completed_episodes = []
+    update = 0
+    metrics_path = output_dir / "metrics.csv"
+
+    with open(metrics_path, "w", encoding="utf-8", newline="") as metrics_file:
+        writer = csv.DictWriter(
+            metrics_file,
+            fieldnames=[
+                "update",
+                "total_timesteps",
+                "mean_episode_return",
+                "mean_episode_length",
+                "loss",
+                "policy_loss",
+                "value_loss",
+                "entropy",
+                "approx_kl",
+                "clip_fraction",
+                "explained_variance",
+            ],
+        )
+        writer.writeheader()
+
+        while global_step < args.total_timesteps:
+            update += 1
+            rollout, episodes, global_step = _collect_cpp_batched_rollout(
+                agent,
+                env,
+                global_step,
+            )
+            completed_episodes.extend(episodes)
+            metrics = agent.update(rollout)
+
+            recent_episodes = completed_episodes[-100:]
+            mean_return = _mean([episode["return"] for episode in recent_episodes])
+            mean_length = _mean([episode["length"] for episode in recent_episodes])
+            row = {
+                "update": update,
+                "total_timesteps": global_step,
+                "mean_episode_return": mean_return,
+                "mean_episode_length": mean_length,
+                **metrics,
+            }
+            writer.writerow(row)
+            metrics_file.flush()
+
+            if update % args.log_interval == 0 or update == 1:
+                print(
+                    f"update={update} "
+                    f"steps={global_step} "
+                    f"mean_return={mean_return:.3f} "
+                    f"loss={metrics.get('loss', 0.0):.4f}"
+                )
+
+            if update % args.save_interval == 0:
+                agent.save(output_dir / "model.pt")
+
+        agent.save(output_dir / "model.pt")
+
+    _save_episode_history(output_dir, completed_episodes)
+
+
+def _collect_cpp_batched_rollout(agent, env, global_step):
+    state = env.reset()
+    trajectories = {
+        int(env_index): _empty_trajectory()
+        for env_index in state["active_indices"]
+    }
+    completed_episodes = []
+
+    while len(state["active_indices"]) > 0:
+        active_indices = state["active_indices"]
+        observations = state["observations"]
+        action_masks = state["action_masks"]
+        actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
+        step_result = env.step(actions)
+        rewards = step_result["rewards"]
+        terminated = step_result["terminated"]
+
+        for batch_index, env_index in enumerate(active_indices):
+            env_index = int(env_index)
+            trajectory = trajectories[env_index]
+            trajectory["observations"].append(observations[batch_index])
+            trajectory["actions"].append(int(actions[batch_index]))
+            trajectory["log_probs"].append(float(log_probs[batch_index]))
+            trajectory["rewards"].append(float(rewards[batch_index]))
+            trajectory["dones"].append(float(terminated[batch_index]))
+            trajectory["values"].append(float(values[batch_index]))
+            trajectory["action_masks"].append(action_masks[batch_index])
+
+        global_step += len(active_indices)
+
+        for episode_return, episode_length in zip(
+            step_result["completed_returns"],
+            step_result["completed_lengths"],
+        ):
+            completed_episodes.append(
+                {
+                    "return": float(episode_return),
+                    "length": int(episode_length),
+                    "global_step": global_step,
+                }
+            )
+
+        state = {
+            "active_indices": step_result["active_indices"],
+            "observations": step_result["observations"],
+            "action_masks": step_result["action_masks"],
+        }
+
+    return (
+        _trajectories_to_rollout_batch(
+            trajectories.values(),
+            agent.config.gamma,
+            agent.config.gae_lambda,
+        ),
+        completed_episodes,
+        global_step,
+    )
+
+
+def _empty_trajectory():
+    return {
+        "observations": [],
+        "actions": [],
+        "log_probs": [],
+        "rewards": [],
+        "dones": [],
+        "values": [],
+        "action_masks": [],
+    }
+
+
+def _trajectories_to_rollout_batch(trajectories, gamma, gae_lambda):
+    batches = []
+    for trajectory in trajectories:
+        if not trajectory["rewards"]:
+            continue
+        advantages, returns = _compute_episode_advantages(
+            trajectory["rewards"],
+            trajectory["values"],
+            gamma,
+            gae_lambda,
+        )
+        batches.append(
+            {
+                **trajectory,
+                "advantages": advantages,
+                "returns": returns,
+            }
+        )
+
+    return RolloutBatch(
+        observations=np.asarray(
+            [observation for batch in batches for observation in batch["observations"]],
+            dtype=np.float32,
+        ),
+        actions=np.asarray(
+            [action for batch in batches for action in batch["actions"]],
+            dtype=np.int64,
+        ),
+        log_probs=np.asarray(
+            [log_prob for batch in batches for log_prob in batch["log_probs"]],
+            dtype=np.float32,
+        ),
+        rewards=np.asarray(
+            [reward for batch in batches for reward in batch["rewards"]],
+            dtype=np.float32,
+        ),
+        dones=np.asarray(
+            [done for batch in batches for done in batch["dones"]],
+            dtype=np.float32,
+        ),
+        values=np.asarray(
+            [value for batch in batches for value in batch["values"]],
+            dtype=np.float32,
+        ),
+        action_masks=np.asarray(
+            [mask for batch in batches for mask in batch["action_masks"]],
+            dtype=bool,
+        ),
+        advantages=np.asarray(
+            [advantage for batch in batches for advantage in batch["advantages"]],
+            dtype=np.float32,
+        ),
+        returns=np.asarray(
+            [return_ for batch in batches for return_ in batch["returns"]],
+            dtype=np.float32,
+        ),
+    )
+
+
+def _compute_episode_advantages(rewards, values, gamma, gae_lambda):
+    advantages = np.zeros(len(rewards), dtype=np.float32)
+    last_advantage = 0.0
+
+    for index in reversed(range(len(rewards))):
+        if index == len(rewards) - 1:
+            next_value = 0.0
+            next_non_terminal = 0.0
+        else:
+            next_value = values[index + 1]
+            next_non_terminal = 1.0
+
+        delta = rewards[index] + gamma * next_value * next_non_terminal - values[index]
+        last_advantage = delta + gamma * gae_lambda * next_non_terminal * last_advantage
+        advantages[index] = last_advantage
+
+    returns = advantages + np.asarray(values, dtype=np.float32)
+    return advantages, returns
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="Train masked PPO from scratch with PyTorch.")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--n-envs", type=int, default=6)
+    parser.add_argument("--rollout-size", type=int, default=1200)
     parser.add_argument("--learning-player", type=int, default=0)
     parser.add_argument("--fixed-declarer", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -229,13 +458,7 @@ def _parse_args():
 
 
 def _make_env(args, env_index):
-    env_class = SkatSingleAgentEnv
-    if args.env == "cpp":
-        if SkatCppSingleAgentEnv is None:
-            raise ImportError("C++ Skat env is unavailable. Build the extension or use --env python.")
-        env_class = SkatCppSingleAgentEnv
-
-    return env_class(
+    return SkatSingleAgentEnv(
         learning_player=args.learning_player,
         fixed_declarer=args.fixed_declarer,
         seed=_env_seed(args.seed, env_index),
@@ -245,7 +468,8 @@ def _make_env(args, env_index):
 def _env_seed(seed, env_index):
     if seed is None:
         return None
-    return int(seed) + env_index * SEED_SPACING
+    seed_sequence = np.random.SeedSequence([int(seed), int(env_index)])
+    return int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
 
 
 def _save_config(output_dir, args, config):

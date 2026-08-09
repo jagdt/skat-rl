@@ -1,5 +1,11 @@
 #include "fast_skat.h"
 
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -42,6 +48,99 @@ py::dict state_summary(const skat_rl::FastSkatGame& game) {
     return result;
 }
 
+uint64_t uint64_from_python_int(const py::handle& value, const char* argument_name) {
+    py::object index = py::reinterpret_steal<py::object>(PyNumber_Index(value.ptr()));
+    if (!index) {
+        PyErr_Clear();
+        throw py::type_error(std::string(argument_name) + " must be an integer.");
+    }
+
+    const unsigned long long converted = PyLong_AsUnsignedLongLong(index.ptr());
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        throw py::value_error(
+            std::string(argument_name) + " must be in range 0..2**64 - 1."
+        );
+    }
+    return static_cast<uint64_t>(converted);
+}
+
+std::vector<uint64_t> uint64_vector_from_sequence(const py::sequence& values) {
+    std::vector<uint64_t> result;
+    result.reserve(static_cast<std::size_t>(values.size()));
+    for (const py::handle value : values) {
+        result.push_back(uint64_from_python_int(value, "seed"));
+    }
+    return result;
+}
+
+py::array_t<float> float_array(const std::vector<float>& values, py::ssize_t rows, py::ssize_t cols) {
+    py::array_t<float> array({rows, cols});
+    if (!values.empty()) {
+        std::memcpy(array.mutable_data(), values.data(), values.size() * sizeof(float));
+    }
+    return array;
+}
+
+py::array_t<int> int_array(const std::vector<int>& values) {
+    py::array_t<int> array(values.size());
+    if (!values.empty()) {
+        std::memcpy(array.mutable_data(), values.data(), values.size() * sizeof(int));
+    }
+    return array;
+}
+
+py::array_t<float> float_array_1d(const std::vector<float>& values) {
+    py::array_t<float> array(values.size());
+    if (!values.empty()) {
+        std::memcpy(array.mutable_data(), values.data(), values.size() * sizeof(float));
+    }
+    return array;
+}
+
+py::array_t<bool> bool_array(const std::vector<uint8_t>& values, py::ssize_t rows, py::ssize_t cols) {
+    py::array_t<bool> array({rows, cols});
+    auto* output = static_cast<bool*>(array.mutable_data());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        output[index] = values[index] != 0;
+    }
+    return array;
+}
+
+py::array_t<bool> bool_array_1d(const std::vector<uint8_t>& values) {
+    py::array_t<bool> array(values.size());
+    auto* output = static_cast<bool*>(array.mutable_data());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        output[index] = values[index] != 0;
+    }
+    return array;
+}
+
+py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
+                                   const skat_rl::BatchedStepInfo& info) {
+    py::dict result;
+    result["env_indices"] = int_array(info.env_indices);
+    result["rewards"] = float_array_1d(info.rewards);
+    result["terminated"] = bool_array_1d(info.terminated);
+    result["completed_env_indices"] = int_array(info.completed_env_indices);
+    result["completed_returns"] = float_array_1d(info.completed_returns);
+    result["completed_lengths"] = int_array(info.completed_lengths);
+
+    const int active_count = env.active_count();
+    result["active_indices"] = int_array(env.active_indices());
+    result["observations"] = float_array(
+        env.active_observations(),
+        active_count,
+        skat_rl::kObservationDim
+    );
+    result["action_masks"] = bool_array(
+        env.active_action_masks(),
+        active_count,
+        skat_rl::kNumCards
+    );
+    return result;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_skat_cpp, m) {
@@ -49,10 +148,21 @@ PYBIND11_MODULE(_skat_cpp, m) {
 
     py::class_<skat_rl::FastSkatGame>(m, "FastSkatGame")
         .def(py::init<>())
-        .def("reset", &skat_rl::FastSkatGame::reset, py::arg("seed"))
+        .def(
+            "reset",
+            [](skat_rl::FastSkatGame& game, py::handle seed) {
+                game.reset(uint64_from_python_int(seed, "seed"));
+            },
+            py::arg("seed")
+        )
         .def(
             "reset_fixed_declarer",
-            &skat_rl::FastSkatGame::reset_fixed_declarer,
+            [](skat_rl::FastSkatGame& game, py::handle seed, int fixed_declarer) {
+                game.reset_fixed_declarer(
+                    uint64_from_python_int(seed, "seed"),
+                    fixed_declarer
+                );
+            },
             py::arg("seed"),
             py::arg("fixed_declarer")
         )
@@ -89,4 +199,51 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("game_kind", &skat_rl::FastSkatGame::game_kind)
         .def("trump_suit", &skat_rl::FastSkatGame::trump_suit)
         .def("state_summary", &state_summary);
+
+    py::class_<skat_rl::BatchedFastSkatEnv>(m, "BatchedFastSkatEnv")
+        .def(
+            py::init<int, int, int>(),
+            py::arg("size"),
+            py::arg("learning_player"),
+            py::arg("fixed_declarer") = -1
+        )
+        .def(
+            "reset",
+            [](skat_rl::BatchedFastSkatEnv& env, py::handle seed) {
+                env.reset(uint64_from_python_int(seed, "seed"));
+            },
+            py::arg("seed")
+        )
+        .def(
+            "reset_many",
+            [](skat_rl::BatchedFastSkatEnv& env, const py::sequence& seeds) {
+                env.reset_many(uint64_vector_from_sequence(seeds));
+            },
+            py::arg("seeds")
+        )
+        .def("size", &skat_rl::BatchedFastSkatEnv::size)
+        .def("active_count", &skat_rl::BatchedFastSkatEnv::active_count)
+        .def("learning_player", &skat_rl::BatchedFastSkatEnv::learning_player)
+        .def("observation_dim", &skat_rl::BatchedFastSkatEnv::observation_dim)
+        .def("action_dim", &skat_rl::BatchedFastSkatEnv::action_dim)
+        .def("active_indices", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return int_array(env.active_indices());
+        })
+        .def("observations", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return float_array(
+                env.active_observations(),
+                env.active_count(),
+                skat_rl::kObservationDim
+            );
+        })
+        .def("action_masks", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return bool_array(
+                env.active_action_masks(),
+                env.active_count(),
+                skat_rl::kNumCards
+            );
+        })
+        .def("step", [](skat_rl::BatchedFastSkatEnv& env, const std::vector<int>& actions) {
+            return batched_step_info_to_dict(env, env.step(actions));
+        });
 }

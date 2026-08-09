@@ -1,6 +1,8 @@
 import random
 
-from skat_rl._skat_cpp import FastSkatGame
+import pytest
+
+from skat_rl._skat_cpp import BatchedFastSkatEnv, FastSkatGame
 
 
 def test_cpp_extension_imports_and_resets():
@@ -13,6 +15,23 @@ def test_cpp_extension_imports_and_resets():
     assert len(summary["hands"][2]) == 10
     assert len(summary["skat"]) == 2
     assert not summary["terminated"]
+
+
+def test_cpp_resets_accept_full_uint64_seed_range():
+    game = FastSkatGame()
+    batch = BatchedFastSkatEnv(2, 0, 0)
+
+    for seed in [0, 2**32, 2**63 - 1, 2**63, 2**64 - 1]:
+        game.reset(seed)
+        assert len(game.skat()) == 2
+
+    batch.reset_many([2**63, 2**64 - 1])
+    assert batch.active_count() == 2
+
+    with pytest.raises(ValueError):
+        game.reset(-1)
+    with pytest.raises(ValueError):
+        batch.reset_many([0, 2**64])
 
 
 def test_legal_mask_contains_only_current_player_hand_cards():

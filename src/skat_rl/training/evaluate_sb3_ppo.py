@@ -1,4 +1,4 @@
-# src/skat_rl/training/evaluate_maskable_ppo.py
+# src/skat_rl/training/evaluate_sb3_ppo.py
 
 import argparse
 
@@ -101,7 +101,7 @@ def main():
     args = parser.parse_args()
 
     evaluate(
-        model_path=f"models/maskable_ppo_skat_player0_{args.timestamp}/model.zip",
+        model_path=f"models/sb3_ppo_skat_player0_{args.timestamp}/model.zip",
         n_games=1000,
     )
 
