@@ -66,6 +66,7 @@ class SkatCppBatchedSingleAgentEnv:
             "active_indices": np.asarray(self.game.active_indices(), dtype=np.int64),
             "observations": np.asarray(self.game.observations(), dtype=np.float32),
             "action_masks": np.asarray(self.game.action_masks(), dtype=bool),
+            "belief_targets": np.asarray(self.game.belief_targets(), dtype=np.int64),
         }
 
     def _format_step_result(self, result):
@@ -79,4 +80,5 @@ class SkatCppBatchedSingleAgentEnv:
             "active_indices": np.asarray(result["active_indices"], dtype=np.int64),
             "observations": np.asarray(result["observations"], dtype=np.float32),
             "action_masks": np.asarray(result["action_masks"], dtype=bool),
+            "belief_targets": np.asarray(result["belief_targets"], dtype=np.int64),
         }

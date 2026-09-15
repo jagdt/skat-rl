@@ -430,6 +430,25 @@ std::vector<float> FastSkatGame::observation(int player) const {
     return obs;
 }
 
+std::vector<int> FastSkatGame::belief_targets(int player) const {
+    validate_player(player);
+    const int next_opponent = (player + 1) % kNumPlayers;
+    const int previous_opponent = (player + 2) % kNumPlayers;
+    std::vector<int> targets(kNumCards, -1);
+
+    for (int card = 0; card < kNumCards; ++card) {
+        const uint32_t bit = uint32_t{1} << card;
+        if (hands_[next_opponent] & bit) {
+            targets[card] = 0;
+        } else if (hands_[previous_opponent] & bit) {
+            targets[card] = 1;
+        } else if (card == skat_[0] || card == skat_[1]) {
+            targets[card] = 2;
+        }
+    }
+    return targets;
+}
+
 StepInfo FastSkatGame::step(int action) {
     validate_card(action);
     if (terminated_) {
@@ -778,6 +797,17 @@ std::vector<uint8_t> BatchedFastSkatEnv::active_action_masks() const {
         }
     }
     return masks;
+}
+
+std::vector<int> BatchedFastSkatEnv::active_belief_targets() const {
+    const std::vector<int> indices = active_indices();
+    std::vector<int> targets;
+    targets.reserve(indices.size() * kNumCards);
+    for (int env_index : indices) {
+        std::vector<int> game_targets = games_[env_index].belief_targets(learning_player_);
+        targets.insert(targets.end(), game_targets.begin(), game_targets.end());
+    }
+    return targets;
 }
 
 int BatchedFastSkatEnv::active_count() const {

@@ -48,6 +48,18 @@ def test_legal_mask_contains_only_current_player_hand_cards():
     assert {card for card, is_legal in enumerate(mask) if is_legal} == legal_actions
 
 
+def test_belief_targets_encode_relative_opponents_and_skat():
+    game = FastSkatGame()
+    game.reset(7)
+    summary = game.state_summary()
+    targets = game.belief_targets(0)
+
+    assert all(targets[card] == -1 for card in summary["hands"][0])
+    assert all(targets[card] == 0 for card in summary["hands"][1])
+    assert all(targets[card] == 1 for card in summary["hands"][2])
+    assert all(targets[card] == 2 for card in summary["skat"])
+
+
 def test_playing_legal_card_removes_it_from_hand():
     game = FastSkatGame()
     game.reset(1)

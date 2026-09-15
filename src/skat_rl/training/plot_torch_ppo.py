@@ -93,6 +93,8 @@ def plot_metrics(run_dir, output_path=None):
         "loss",
         "policy_loss",
         "value_loss",
+        "belief_loss",
+        "belief_accuracy",
         "entropy",
         "approx_kl",
         "clip_fraction",

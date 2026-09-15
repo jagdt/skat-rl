@@ -73,6 +73,7 @@ public:
     uint32_t legal_mask_bits() const;
     std::vector<bool> legal_mask_array() const;
     std::vector<float> observation(int player) const;
+    std::vector<int> belief_targets(int player) const;
     StepInfo step(int action);
 
     bool is_terminal() const;
@@ -136,6 +137,7 @@ public:
     std::vector<int> active_indices() const;
     std::vector<float> active_observations() const;
     std::vector<uint8_t> active_action_masks() const;
+    std::vector<int> active_belief_targets() const;
     int active_count() const;
     int size() const;
     int learning_player() const;

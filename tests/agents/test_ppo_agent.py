@@ -7,6 +7,7 @@ from skat_rl.agents.ppo_agent import (  # noqa: E402
     PPOAgent,
     PPOConfig,
     RolloutBuffer,
+    SkatTransformerActorCritic,
     masked_categorical,
 )
 
@@ -174,3 +175,87 @@ def test_agent_save_and_load_round_trip(tmp_path):
     assert loaded.config == agent.config
     for name, parameter in agent.model.state_dict().items():
         assert torch.equal(parameter, loaded.model.state_dict()[name])
+
+
+def _tiny_transformer_config(**overrides):
+    values = {
+        "observation_dim": 1149,
+        "action_dim": 32,
+        "architecture": "transformer",
+        "transformer_dim": 32,
+        "transformer_layers": 1,
+        "transformer_heads": 4,
+        "transformer_ff_dim": 64,
+        "belief_decoder_layers": 1,
+        "update_epochs": 1,
+        "minibatch_size": 2,
+    }
+    values.update(overrides)
+    return PPOConfig(**values)
+
+
+def test_transformer_outputs_policy_value_and_card_beliefs():
+    agent = PPOAgent(_tiny_transformer_config(), device="cpu")
+    observations = np.zeros((2, 1149), dtype=np.float32)
+    action_masks = np.ones((2, 32), dtype=bool)
+
+    actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
+    beliefs = agent.get_belief_probabilities(observations)
+
+    assert actions.shape == (2,)
+    assert log_probs.shape == (2,)
+    assert values.shape == (2,)
+    assert beliefs.shape == (2, 32, 3)
+    assert beliefs.sum(axis=-1) == pytest.approx(np.ones((2, 32)))
+
+
+def test_belief_detach_controls_ppo_gradient_into_belief_decoder():
+    model = SkatTransformerActorCritic(_tiny_transformer_config())
+    observations = torch.zeros((2, 1149))
+
+    policy_logits, values, _ = model.outputs(observations, detach_beliefs=True)
+    (policy_logits.sum() + values.sum()).backward()
+    assert model.belief_head.weight.grad is None
+
+    model.zero_grad()
+    policy_logits, values, _ = model.outputs(observations, detach_beliefs=False)
+    (policy_logits.sum() + values.sum()).backward()
+    assert model.belief_head.weight.grad is not None
+    assert model.belief_head.weight.grad.abs().sum().item() > 0.0
+
+
+def test_transformer_update_trains_belief_head_with_supervised_targets():
+    torch.manual_seed(3)
+    config = _tiny_transformer_config(belief_detach_updates=10)
+    agent = PPOAgent(config, device="cpu")
+    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim)
+    observations = np.zeros((1, config.observation_dim), dtype=np.float32)
+    masks = np.ones((1, config.action_dim), dtype=bool)
+    targets = np.arange(config.action_dim, dtype=np.int64)[None, :] % 3
+
+    for step in range(2):
+        actions, log_probs, values = agent.get_action_and_value(observations, masks)
+        rollout.add(
+            step,
+            observations,
+            actions,
+            log_probs,
+            np.array([float(step)], dtype=np.float32),
+            np.array([float(step == 1)], dtype=np.float32),
+            values,
+            masks,
+            targets,
+        )
+    rollout.compute_returns_and_advantages(
+        last_values=np.zeros(1, dtype=np.float32),
+        last_dones=np.ones(1, dtype=np.float32),
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+    )
+    before = agent.model.belief_head.weight.detach().clone()
+
+    metrics = agent.update(rollout.flatten())
+
+    assert metrics["belief_loss"] > 0.0
+    assert 0.0 <= metrics["belief_accuracy"] <= 1.0
+    assert not torch.equal(before, agent.model.belief_head.weight)

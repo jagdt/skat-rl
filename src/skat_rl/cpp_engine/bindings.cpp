@@ -90,6 +90,16 @@ py::array_t<int> int_array(const std::vector<int>& values) {
     return array;
 }
 
+py::array_t<int> int_array_2d(const std::vector<int>& values,
+                              py::ssize_t rows,
+                              py::ssize_t cols) {
+    py::array_t<int> array({rows, cols});
+    if (!values.empty()) {
+        std::memcpy(array.mutable_data(), values.data(), values.size() * sizeof(int));
+    }
+    return array;
+}
+
 py::array_t<float> float_array_1d(const std::vector<float>& values) {
     py::array_t<float> array(values.size());
     if (!values.empty()) {
@@ -138,6 +148,11 @@ py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
         active_count,
         skat_rl::kNumCards
     );
+    result["belief_targets"] = int_array_2d(
+        env.active_belief_targets(),
+        active_count,
+        skat_rl::kNumCards
+    );
     return result;
 }
 
@@ -180,6 +195,7 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("legal_mask_bits", &skat_rl::FastSkatGame::legal_mask_bits)
         .def("legal_mask_array", &skat_rl::FastSkatGame::legal_mask_array)
         .def("observation", &skat_rl::FastSkatGame::observation, py::arg("player"))
+        .def("belief_targets", &skat_rl::FastSkatGame::belief_targets, py::arg("player"))
         .def("step", [](skat_rl::FastSkatGame& game, int action) {
             return step_info_to_dict(game.step(action));
         })
@@ -239,6 +255,13 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("action_masks", [](const skat_rl::BatchedFastSkatEnv& env) {
             return bool_array(
                 env.active_action_masks(),
+                env.active_count(),
+                skat_rl::kNumCards
+            );
+        })
+        .def("belief_targets", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return int_array_2d(
+                env.active_belief_targets(),
                 env.active_count(),
                 skat_rl::kNumCards
             );

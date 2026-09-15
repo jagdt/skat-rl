@@ -19,6 +19,9 @@ def test_cpp_batched_env_reset_shapes_and_masks():
     assert state["action_masks"].shape == (4, 32)
     assert state["action_masks"].dtype == bool
     assert state["action_masks"].any(axis=1).all()
+    assert state["belief_targets"].shape == (4, 32)
+    assert state["belief_targets"].dtype == np.int64
+    assert np.isin(state["belief_targets"], [-1, 0, 1, 2]).all()
 
 
 def test_cpp_batched_env_derives_deterministic_distinct_child_seeds():
@@ -58,6 +61,7 @@ def test_cpp_batched_env_steps_all_active_games_until_done():
             "active_indices": result["active_indices"],
             "observations": result["observations"],
             "action_masks": result["action_masks"],
+            "belief_targets": result["belief_targets"],
         }
 
     assert total_steps == 30

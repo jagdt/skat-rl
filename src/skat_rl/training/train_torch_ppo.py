@@ -51,8 +51,17 @@ def main():
         config = PPOConfig(
             observation_dim=observation_dim,
             action_dim=action_dim,
+            architecture=args.architecture,
             hidden_sizes=tuple(args.hidden_sizes),
             activation=args.activation,
+            transformer_dim=args.transformer_dim,
+            transformer_layers=args.transformer_layers,
+            transformer_heads=args.transformer_heads,
+            transformer_ff_dim=args.transformer_ff_dim,
+            transformer_dropout=args.transformer_dropout,
+            belief_decoder_layers=args.belief_decoder_layers,
+            belief_coef=args.belief_coef,
+            belief_detach_updates=args.belief_detach_updates,
             learning_rate=args.learning_rate,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
@@ -74,7 +83,7 @@ def main():
             if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
                 raise ValueError("Checkpoint observation/action dimensions do not match the env.")
 
-        _save_config(output_dir, args, config)
+        _save_config(output_dir, args, agent.config)
         if args.env == "cpp":
             _train_cpp_batched(agent, envs, args, output_dir, global_step)
         else:
@@ -122,6 +131,8 @@ def _train_python(agent, envs, args, output_dir, global_step):
                 "loss",
                 "policy_loss",
                 "value_loss",
+                "belief_loss",
+                "belief_accuracy",
                 "entropy",
                 "approx_kl",
                 "clip_fraction",
@@ -135,6 +146,10 @@ def _train_python(agent, envs, args, output_dir, global_step):
                 action_masks = np.asarray(
                     [env.action_masks() for env in envs],
                     dtype=bool,
+                )
+                belief_targets = np.asarray(
+                    [env.belief_targets() for env in envs],
+                    dtype=np.int64,
                 )
                 actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
 
@@ -174,6 +189,7 @@ def _train_python(agent, envs, args, output_dir, global_step):
                     dones,
                     values,
                     action_masks,
+                    belief_targets,
                 )
                 observations = np.asarray(next_observations, dtype=np.float32)
                 dones = next_dones
@@ -230,6 +246,8 @@ def _train_cpp_batched(agent, env, args, output_dir, global_step):
                 "loss",
                 "policy_loss",
                 "value_loss",
+                "belief_loss",
+                "belief_accuracy",
                 "entropy",
                 "approx_kl",
                 "clip_fraction",
@@ -289,6 +307,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
         active_indices = state["active_indices"]
         observations = state["observations"]
         action_masks = state["action_masks"]
+        belief_targets = state["belief_targets"]
         actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
         step_result = env.step(actions)
         rewards = step_result["rewards"]
@@ -304,6 +323,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
             trajectory["dones"].append(float(terminated[batch_index]))
             trajectory["values"].append(float(values[batch_index]))
             trajectory["action_masks"].append(action_masks[batch_index])
+            trajectory["belief_targets"].append(belief_targets[batch_index])
 
         global_step += len(active_indices)
 
@@ -323,6 +343,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
             "active_indices": step_result["active_indices"],
             "observations": step_result["observations"],
             "action_masks": step_result["action_masks"],
+            "belief_targets": step_result["belief_targets"],
         }
 
     return (
@@ -345,6 +366,7 @@ def _empty_trajectory():
         "dones": [],
         "values": [],
         "action_masks": [],
+        "belief_targets": [],
     }
 
 
@@ -404,6 +426,10 @@ def _trajectories_to_rollout_batch(trajectories, gamma, gae_lambda):
             [return_ for batch in batches for return_ in batch["returns"]],
             dtype=np.float32,
         ),
+        belief_targets=np.asarray(
+            [target for batch in batches for target in batch.get("belief_targets", [])],
+            dtype=np.int64,
+        ) if all("belief_targets" in batch for batch in batches) else None,
     )
 
 
@@ -432,16 +458,25 @@ def _parse_args():
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--n-envs", type=int, default=6)
-    parser.add_argument("--rollout-size", type=int, default=1200)
+    parser.add_argument("--rollout-size", type=int, default=2000)
     parser.add_argument("--learning-player", type=int, default=0)
     parser.add_argument("--fixed-declarer", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--env", choices=["python", "cpp"], default="python")
+    parser.add_argument("--env", choices=["python", "cpp"], default="cpp")
     parser.add_argument("--output-dir", default="models")
     parser.add_argument("--continue-model")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512])
+    parser.add_argument("--architecture", choices=["mlp", "transformer"], default="transformer")
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512, 512, 512])
     parser.add_argument("--activation", choices=["tanh", "relu", "gelu"], default="tanh")
+    parser.add_argument("--transformer-dim", type=int, default=256)
+    parser.add_argument("--transformer-layers", type=int, default=4)
+    parser.add_argument("--transformer-heads", type=int, default=8)
+    parser.add_argument("--transformer-ff-dim", type=int, default=1024)
+    parser.add_argument("--transformer-dropout", type=float, default=0.0)
+    parser.add_argument("--belief-decoder-layers", type=int, default=2)
+    parser.add_argument("--belief-coef", type=float, default=1.0)
+    parser.add_argument("--belief-detach-updates", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)

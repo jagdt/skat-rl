@@ -21,6 +21,13 @@ def test_nonzero_learning_player_is_fixed_declarer():
     env = SkatSingleAgentEnv(learning_player=2, fixed_declarer=2, seed=1)
     env.reset(seed=1)
 
+    targets = env.belief_targets()
+    next_opponent = (env.learning_player + 1) % 3
+    previous_opponent = (env.learning_player + 2) % 3
+    assert all(targets[card] == 0 for card in env.game.state.hands[next_opponent])
+    assert all(targets[card] == 1 for card in env.game.state.hands[previous_opponent])
+    assert all(targets[card] == 2 for card in env.game.state.skat)
+
     assert env.game.state.declarer == 2
     assert env.game._choose_declarer(env.game.state.hands) == 2
 

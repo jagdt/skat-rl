@@ -1,6 +1,7 @@
 import argparse
 import json
 
+import numpy as np
 import pytest
 
 pytest.importorskip("torch")
@@ -145,3 +146,5 @@ def test_collect_cpp_batched_rollout_collects_complete_games():
     assert [episode["length"] for episode in episodes] == [10, 10]
     assert rollout.observations.shape == (20, 1149)
     assert rollout.action_masks.shape == (20, 32)
+    assert rollout.belief_targets.shape == (20, 32)
+    assert set(np.unique(rollout.belief_targets)) <= {-1, 0, 1, 2}

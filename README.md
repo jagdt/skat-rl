@@ -2,6 +2,10 @@
 
 Skat-RL is a reinforcement-learning playground for the card game Skat. The project contains a Skat engine with card/rule utilities and random, heuristic, Stable-Baselines3 Maskable PPO, and native PyTorch PPO agents that can train and play against random and heuristic players.
 
+## Architecture
+
+The transformer has a shared Skat encoder, and separate value, policy and supervised hidden-card belief heads.
+Both a python and a batched C++ environment are available.
 
 ## Setup
 
@@ -46,6 +50,4 @@ python -m skat_rl.training.plot_torch_ppo models/torch_ppo_skat_player0_YYYYMMDD
 
 This is an experimental project. Things that might be implemented in the future:
 
-- Batched  and parallelized C++ Skat engine for fast training data generation
 - Self-play of RL agents
-- Transformer architecture

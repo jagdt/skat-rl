@@ -155,6 +155,23 @@ class SkatSingleAgentEnv(gym.Env):
 
         return mask
 
+    def belief_targets(self):
+        """Hidden-card locations relative to the learning player."""
+        targets = np.full(32, -1, dtype=np.int64)
+        state = self.game.state
+        if state is None or state.terminated:
+            return targets
+
+        next_opponent = (self.learning_player + 1) % 3
+        previous_opponent = (self.learning_player + 2) % 3
+        for card in state.hands[next_opponent]:
+            targets[card] = 0
+        for card in state.hands[previous_opponent]:
+            targets[card] = 1
+        for card in state.skat:
+            targets[card] = 2
+        return targets
+
     def render(self):
         if self.game.state is None:
             print("No game state.")
