@@ -7,6 +7,7 @@ from skat_rl.agents.ppo_agent import (  # noqa: E402
     PPOAgent,
     PPOConfig,
     RolloutBuffer,
+    SkatObservationTokenizer,
     SkatTransformerActorCritic,
     masked_categorical,
 )
@@ -182,16 +183,42 @@ def _tiny_transformer_config(**overrides):
         "observation_dim": 1149,
         "action_dim": 32,
         "architecture": "transformer",
+        "use_belief": True,
         "transformer_dim": 32,
         "transformer_layers": 1,
         "transformer_heads": 4,
         "transformer_ff_dim": 64,
-        "belief_decoder_layers": 1,
         "update_epochs": 1,
         "minibatch_size": 2,
     }
     values.update(overrides)
     return PPOConfig(**values)
+
+
+def test_tokenizer_uses_relative_players_and_ordered_play_history():
+    tokenizer = SkatObservationTokenizer(model_dim=16)
+    observations = np.zeros((2, 1149), dtype=np.float32)
+    observations[:, 8] = 1.0  # Own spade seven.
+    observations[:, 32 + 6] = 1.0  # Club ace was played in the first slot.
+    observations[:, 1123] = 1.0  # Suit game.
+    observations[:, 1128] = 1.0  # Hearts trump.
+
+    for row, current_player in enumerate([0, 1]):
+        observations[row, 1114 + current_player] = 1.0
+        observations[row, 1117 + (current_player + 2) % 3] = 1.0
+        observations[row, 1120 + (current_player + 1) % 3] = 1.0
+        observations[row, 992 + (current_player + 1) % 3] = 1.0
+
+    tokens = tokenizer(torch.as_tensor(observations))
+
+    assert tokens.shape == (2, 33, 16)
+    assert torch.allclose(tokens[0], tokens[1])
+
+    without_history = observations[:1].copy()
+    without_history[0, 32 + 6] = 0.0
+    without_history[0, 992 + 1] = 0.0
+    unplayed_tokens = tokenizer(torch.as_tensor(without_history))
+    assert not torch.allclose(tokens[0, 1 + 6], unplayed_tokens[0, 1 + 6])
 
 
 def test_transformer_outputs_policy_value_and_card_beliefs():
@@ -209,26 +236,37 @@ def test_transformer_outputs_policy_value_and_card_beliefs():
     assert beliefs.sum(axis=-1) == pytest.approx(np.ones((2, 32)))
 
 
-def test_belief_detach_controls_ppo_gradient_into_belief_decoder():
+def test_auxiliary_belief_does_not_feed_policy_or_value_heads():
     model = SkatTransformerActorCritic(_tiny_transformer_config())
     observations = torch.zeros((2, 1149))
 
-    policy_logits, values, _ = model.outputs(observations, detach_beliefs=True)
+    policy_logits, values, belief_logits = model.outputs(observations)
+    rollout_policy_logits, rollout_values, rollout_beliefs = model.outputs(
+        observations, include_belief=False,
+    )
+    assert policy_logits.shape == (2, 32)
+    assert values.shape == (2,)
+    assert belief_logits.shape == (2, 32, 3)
+    assert rollout_beliefs is None
+    assert torch.allclose(policy_logits, rollout_policy_logits)
+    assert torch.allclose(values, rollout_values)
+
     (policy_logits.sum() + values.sum()).backward()
-    assert model.belief_head.weight.grad is None
+    assert all(parameter.grad is None for parameter in model.belief_head.parameters())
 
     model.zero_grad()
-    policy_logits, values, _ = model.outputs(observations, detach_beliefs=False)
-    (policy_logits.sum() + values.sum()).backward()
-    assert model.belief_head.weight.grad is not None
-    assert model.belief_head.weight.grad.abs().sum().item() > 0.0
+    _, _, belief_logits = model.outputs(observations)
+    belief_logits.sum().backward()
+    assert all(parameter.grad is None for parameter in model.policy_head.parameters())
+    assert all(parameter.grad is None for parameter in model.value_head.parameters())
+    assert any(parameter.grad is not None for parameter in model.encoder.parameters())
 
 
 def test_transformer_update_trains_belief_head_with_supervised_targets():
     torch.manual_seed(3)
-    config = _tiny_transformer_config(belief_detach_updates=10)
+    config = _tiny_transformer_config()
     agent = PPOAgent(config, device="cpu")
-    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim)
+    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim, use_belief=True)
     observations = np.zeros((1, config.observation_dim), dtype=np.float32)
     masks = np.ones((1, config.action_dim), dtype=bool)
     targets = np.arange(config.action_dim, dtype=np.int64)[None, :] % 3
@@ -252,10 +290,100 @@ def test_transformer_update_trains_belief_head_with_supervised_targets():
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
     )
-    before = agent.model.belief_head.weight.detach().clone()
+    before = agent.model.belief_head[-1].weight.detach().clone()
 
     metrics = agent.update(rollout.flatten())
 
     assert metrics["belief_loss"] > 0.0
     assert 0.0 <= metrics["belief_accuracy"] <= 1.0
-    assert not torch.equal(before, agent.model.belief_head.weight)
+    assert not torch.equal(before, agent.model.belief_head[-1].weight)
+
+
+def test_transformer_without_belief_has_only_policy_and_value_heads(tmp_path):
+    config = _tiny_transformer_config(use_belief=False)
+    agent = PPOAgent(config, device="cpu")
+    observations = np.zeros((2, config.observation_dim), dtype=np.float32)
+    masks = np.ones((2, config.action_dim), dtype=bool)
+
+    actions, log_probs, values = agent.get_action_and_value(observations, masks)
+    _, _, belief_logits = agent.model.outputs(torch.as_tensor(observations))
+
+    assert actions.shape == log_probs.shape == values.shape == (2,)
+    assert belief_logits is None
+    assert not hasattr(agent.model, "belief_head")
+    assert agent.model.policy_head[0].in_features == 2 * config.transformer_dim
+    with pytest.raises(RuntimeError, match="belief-enabled"):
+        agent.get_belief_probabilities(observations)
+
+    path = tmp_path / "no_belief.pt"
+    agent.save(path)
+    loaded = PPOAgent.load(path, device="cpu")
+    assert loaded.config.use_belief is False
+    assert not hasattr(loaded.model, "belief_head")
+    assert loaded.get_action_and_value(observations, masks)[2].shape == (2,)
+
+
+def test_transformer_without_belief_updates_without_targets():
+    config = _tiny_transformer_config(use_belief=False)
+    agent = PPOAgent(config, device="cpu")
+    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim, use_belief=False)
+    observations = np.zeros((1, config.observation_dim), dtype=np.float32)
+    masks = np.ones((1, config.action_dim), dtype=bool)
+
+    for step in range(2):
+        actions, log_probs, values = agent.get_action_and_value(observations, masks)
+        rollout.add(
+            step, observations, actions, log_probs,
+            np.array([float(step)], dtype=np.float32),
+            np.array([float(step == 1)], dtype=np.float32),
+            values, masks,
+        )
+    rollout.compute_returns_and_advantages(
+        np.zeros(1, dtype=np.float32), np.ones(1, dtype=np.float32),
+        config.gamma, config.gae_lambda,
+    )
+    batch = rollout.flatten()
+    assert batch.belief_targets is None
+    metrics = agent.update(batch)
+    assert metrics["belief_loss"] == 0.0
+    assert metrics["belief_accuracy"] == 0.0
+
+
+def test_transformer_config_defaults_to_no_belief():
+    config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
+                       transformer_dim=32, transformer_layers=1, transformer_heads=4,
+                       transformer_ff_dim=64)
+    agent = PPOAgent(config, device="cpu")
+
+    assert config.use_belief is False
+    assert not hasattr(agent.model, "belief_head")
+
+
+def test_legacy_transformer_checkpoint_without_use_belief_stays_enabled(tmp_path):
+    config = _tiny_transformer_config()
+    agent = PPOAgent(config, device="cpu")
+    path = tmp_path / "legacy_model.pt"
+    agent.save(path)
+    checkpoint = torch.load(path, map_location="cpu")
+    del checkpoint["config"]["use_belief"]
+    checkpoint["config"]["belief_decoder_layers"] = 2
+    checkpoint["config"]["belief_detach_updates"] = 100
+    torch.save(checkpoint, path)
+
+    loaded = PPOAgent.load(path, device="cpu")
+
+    assert loaded.config.use_belief is True
+    assert hasattr(loaded.model, "belief_head")
+    assert "belief_decoder_layers" not in loaded.config.__dict__
+
+
+def test_incompatible_transformer_checkpoint_has_clear_error(tmp_path):
+    agent = PPOAgent(_tiny_transformer_config(), device="cpu")
+    path = tmp_path / "old_model.pt"
+    agent.save(path)
+    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint["model_state_dict"]["policy_head.0.weight"] = torch.zeros((1, 1))
+    torch.save(checkpoint, path)
+
+    with pytest.raises(ValueError, match="Older transformer checkpoints cannot be resumed"):
+        PPOAgent.load(path, device="cpu")

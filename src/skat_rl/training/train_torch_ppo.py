@@ -14,6 +14,8 @@ from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 def main():
     args = _parse_args()
+    if args.architecture == "mlp" and args.use_belief:
+        raise ValueError("--belief requires --architecture transformer.")
     if args.env == "cpp":
         if args.rollout_size < 1:
             raise ValueError("--rollout-size must be at least 1")
@@ -52,6 +54,7 @@ def main():
             observation_dim=observation_dim,
             action_dim=action_dim,
             architecture=args.architecture,
+            use_belief=args.use_belief,
             hidden_sizes=tuple(args.hidden_sizes),
             activation=args.activation,
             transformer_dim=args.transformer_dim,
@@ -59,9 +62,7 @@ def main():
             transformer_heads=args.transformer_heads,
             transformer_ff_dim=args.transformer_ff_dim,
             transformer_dropout=args.transformer_dropout,
-            belief_decoder_layers=args.belief_decoder_layers,
             belief_coef=args.belief_coef,
-            belief_detach_updates=args.belief_detach_updates,
             learning_rate=args.learning_rate,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
@@ -82,6 +83,14 @@ def main():
             global_step = 0
             if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
                 raise ValueError("Checkpoint observation/action dimensions do not match the env.")
+            if args.use_belief and agent.config.architecture != "transformer":
+                raise ValueError("--belief requires a transformer checkpoint.")
+            if (
+                args.use_belief is True
+                and agent.config.architecture == "transformer"
+                and not agent.config.use_belief
+            ):
+                raise ValueError("--belief cannot enable belief in an existing checkpoint.")
 
         _save_config(output_dir, args, agent.config)
         if args.env == "cpp":
@@ -115,6 +124,7 @@ def _train_python(agent, envs, args, output_dir, global_step):
         len(envs),
         agent.config.observation_dim,
         agent.config.action_dim,
+        use_belief=agent.config.architecture == "transformer" and agent.config.use_belief,
     )
     rollout_timesteps = args.rollout_steps * len(envs)
     updates = max(math.ceil(args.total_timesteps / rollout_timesteps), 1)
@@ -147,10 +157,12 @@ def _train_python(agent, envs, args, output_dir, global_step):
                     [env.action_masks() for env in envs],
                     dtype=bool,
                 )
-                belief_targets = np.asarray(
-                    [env.belief_targets() for env in envs],
-                    dtype=np.int64,
-                )
+                belief_targets = None
+                if rollout.belief_targets is not None:
+                    belief_targets = np.asarray(
+                        [env.belief_targets() for env in envs],
+                        dtype=np.int64,
+                    )
                 actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
 
                 next_observations = []
@@ -297,8 +309,9 @@ def _train_cpp_batched(agent, env, args, output_dir, global_step):
 
 def _collect_cpp_batched_rollout(agent, env, global_step):
     state = env.reset()
+    use_belief = agent.config.architecture == "transformer" and agent.config.use_belief
     trajectories = {
-        int(env_index): _empty_trajectory()
+        int(env_index): _empty_trajectory(use_belief)
         for env_index in state["active_indices"]
     }
     completed_episodes = []
@@ -307,7 +320,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
         active_indices = state["active_indices"]
         observations = state["observations"]
         action_masks = state["action_masks"]
-        belief_targets = state["belief_targets"]
+        belief_targets = state["belief_targets"] if use_belief else None
         actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
         step_result = env.step(actions)
         rewards = step_result["rewards"]
@@ -323,7 +336,8 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
             trajectory["dones"].append(float(terminated[batch_index]))
             trajectory["values"].append(float(values[batch_index]))
             trajectory["action_masks"].append(action_masks[batch_index])
-            trajectory["belief_targets"].append(belief_targets[batch_index])
+            if use_belief:
+                trajectory["belief_targets"].append(belief_targets[batch_index])
 
         global_step += len(active_indices)
 
@@ -343,7 +357,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
             "active_indices": step_result["active_indices"],
             "observations": step_result["observations"],
             "action_masks": step_result["action_masks"],
-            "belief_targets": step_result["belief_targets"],
+            "belief_targets": step_result["belief_targets"] if use_belief else None,
         }
 
     return (
@@ -357,8 +371,8 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
     )
 
 
-def _empty_trajectory():
-    return {
+def _empty_trajectory(use_belief=False):
+    trajectory = {
         "observations": [],
         "actions": [],
         "log_probs": [],
@@ -366,8 +380,10 @@ def _empty_trajectory():
         "dones": [],
         "values": [],
         "action_masks": [],
-        "belief_targets": [],
     }
+    if use_belief:
+        trajectory["belief_targets"] = []
+    return trajectory
 
 
 def _trajectories_to_rollout_batch(trajectories, gamma, gae_lambda):
@@ -467,6 +483,9 @@ def _parse_args():
     parser.add_argument("--continue-model")
     parser.add_argument("--device", default=None)
     parser.add_argument("--architecture", choices=["mlp", "transformer"], default="transformer")
+    parser.add_argument("--belief", dest="use_belief", action="store_true",
+                        help="Train an auxiliary supervised hidden-card belief head.")
+    parser.set_defaults(use_belief=False)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512, 512, 512])
     parser.add_argument("--activation", choices=["tanh", "relu", "gelu"], default="tanh")
     parser.add_argument("--transformer-dim", type=int, default=256)
@@ -474,9 +493,7 @@ def _parse_args():
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--transformer-ff-dim", type=int, default=1024)
     parser.add_argument("--transformer-dropout", type=float, default=0.0)
-    parser.add_argument("--belief-decoder-layers", type=int, default=2)
-    parser.add_argument("--belief-coef", type=float, default=1.0)
-    parser.add_argument("--belief-detach-updates", type=int, default=100)
+    parser.add_argument("--belief-coef", type=float, default=0.05)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)

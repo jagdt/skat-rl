@@ -4,7 +4,9 @@ Skat-RL is a reinforcement-learning playground for the card game Skat. The proje
 
 ## Architecture
 
-The transformer has a shared Skat encoder, and separate value, policy and supervised hidden-card belief heads.
+The transformer has a shared Skat encoder and separate value and per-card policy heads.
+An optional supervised hidden-card belief head trains the shared encoder but does
+not feed its predictions into policy or value.
 Both a python and a batched C++ environment are available.
 
 ## Setup

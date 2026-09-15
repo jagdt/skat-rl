@@ -10,12 +10,12 @@ from torch.distributions import Categorical
 from torch.nn import functional as F
 
 
-
 @dataclass
 class PPOConfig:
     observation_dim: int
     action_dim: int
     architecture: str = "mlp"
+    use_belief: bool = False
     hidden_sizes: tuple[int, ...] = (256, 256)
     activation: str = "tanh"
     transformer_dim: int = 256
@@ -23,9 +23,7 @@ class PPOConfig:
     transformer_heads: int = 8
     transformer_ff_dim: int = 1024
     transformer_dropout: float = 0.0
-    belief_decoder_layers: int = 2
-    belief_coef: float = 1.0
-    belief_detach_updates: int = 100
+    belief_coef: float = 0.05
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -57,7 +55,7 @@ class MaskedActorCritic(nn.Module):
             activation,
         )
 
-    def forward(self, observations, action_masks=None, actions=None, detach_beliefs=True):
+    def forward(self, observations, action_masks=None, actions=None):
         logits = self.policy_net(observations)
         distribution = masked_categorical(logits, action_masks)
         values = self.value_net(observations).squeeze(-1)
@@ -76,31 +74,96 @@ class MaskedActorCritic(nn.Module):
     def value(self, observations):
         return self.value_net(observations).squeeze(-1)
 
-    def policy_logits(self, observations, detach_beliefs=True):
+    def policy_logits(self, observations):
         return self.policy_net(observations)
 
 
 class SkatObservationTokenizer(nn.Module):
-    """Turns the fixed 1,149-value Skat observation into semantic tokens."""
+    """Builds one STATE token plus one persistent token for each of the 32 cards.
+
+    Card tokens are deliberately card-centric and fixed in number. They contain only
+    information observable by the acting player:
+
+      card = rank + printed suit + effective suit + status
+             + (played-by + trick + slot, only when already played)
+
+    The STATE token contains the contract, relative declarer, relative current
+    trick leader, and a joint linear projection of numeric score/progress values.
+
+    The tokenizer intentionally does *not* use the old current-player, current-trick,
+    void-info, or explicit defender/declarer-role features as model inputs. The
+    current player is used only to canonicalize absolute player IDs into a relative
+    SELF/NEXT/PREVIOUS frame.
+
+    This assumes history_cards/history_players contain every card already played,
+    including cards in the current trick, in chronological play order.
+    """
 
     observation_dim = 1149
     num_cards = 32
     num_players = 3
     history_slots = 30
+    num_ranks = 8
+    num_suits = 4
+
+    # Contract IDs used internally by the tokenizer.
+    clubs_contract = 0
+    spades_contract = 1
+    hearts_contract = 2
+    diamonds_contract = 3
+    grand_contract = 4
+    null_contract = 5
+    num_contracts = 6
+
+    # Effective card categories: four printed suits plus TRUMP.
+    trump_category = 4
+    num_effective_categories = 5
+
+    # Card status IDs.
+    unknown_status = 0
+    own_status = 1
+    played_status = 2
+    num_card_statuses = 3
+
+    # Matches the Rank enum used by the engine: JACK = 7.
+    jack_rank = 7
 
     def __init__(self, model_dim):
         super().__init__()
-        self.card_embedding = nn.Embedding(self.num_cards, model_dim)
-        self.card_status_embedding = nn.Embedding(3, model_dim)
-        self.history_position_embedding = nn.Embedding(self.history_slots + 1, model_dim)
-        self.played_by_embedding = nn.Embedding(self.num_players + 1, model_dim)
-        self.current_trick_projection = nn.Linear(1, model_dim, bias=False)
 
+        # Card semantics. There is intentionally no separate 32-card-ID embedding:
+        # rank + suit uniquely identify a physical Skat card.
+        self.rank_embedding = nn.Embedding(self.num_ranks, model_dim)
+        self.suit_embedding = nn.Embedding(self.num_suits, model_dim)
+        self.effective_suit_embedding = nn.Embedding(
+            self.num_effective_categories,
+            model_dim,
+        )
+        self.card_status_embedding = nn.Embedding(self.num_card_statuses, model_dim)
+
+        # Played-card metadata. No NONE categories are required; these embeddings
+        # are simply added only for cards whose status is PLAYED.
         self.player_embedding = nn.Embedding(self.num_players, model_dim)
-        self.player_projection = nn.Linear(8, model_dim)
+        self.trick_embedding = nn.Embedding(10, model_dim)
+        self.slot_embedding = nn.Embedding(3, model_dim)
+
+        # Global state semantics.
         self.state_token = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.state_projection = nn.Linear(11, model_dim)
+        self.contract_embedding = nn.Embedding(self.num_contracts, model_dim)
+
+        # Declarer/leader use the same underlying relative-player identity space,
+        # with small role-specific projections so their meaning in STATE is distinct.
+        self.declarer_projection = nn.Linear(model_dim, model_dim, bias=False)
+        self.leader_projection = nn.Linear(model_dim, model_dim, bias=False)
+
+        # [declarer points, defender points, trick progress] -> model space.
+        self.numeric_state_projection = nn.Linear(3, model_dim, bias=False)
+
         self.output_norm = nn.LayerNorm(model_dim)
+
+        card_ids = torch.arange(self.num_cards)
+        self.register_buffer("card_ranks", card_ids % self.num_ranks, persistent=False)
+        self.register_buffer("card_suits", card_ids // self.num_ranks, persistent=False)
 
     def forward(self, observations):
         if observations.shape[-1] != self.observation_dim:
@@ -110,66 +173,134 @@ class SkatObservationTokenizer(nn.Module):
             )
 
         batch_size = observations.shape[0]
+
+        # Existing flat observation layout.
         own_hand = observations[:, 0:32]
         history_cards = observations[:, 32:992].reshape(batch_size, 30, 32)
         history_players = observations[:, 992:1082].reshape(batch_size, 30, 3)
-        current_trick = observations[:, 1082:1114]
         current_player = observations[:, 1114:1117]
         current_leader = observations[:, 1117:1120]
         declarer = observations[:, 1120:1123]
         global_features = observations[:, 1123:1134]
-        void_info = observations[:, 1134:1149].reshape(batch_size, 3, 5)
 
+        # global_features layout used by the current environment:
+        #   0:3   game kind one-hot [SUIT, GRAND, NULL]
+        #   3:7   trump-suit one-hot [CLUBS, SPADES, HEARTS, DIAMONDS]
+        #   7     normalized trick number
+        #   8     normalized current-trick position (intentionally unused)
+        #   9     normalized declarer points
+        #   10    normalized defender points
+        game_kind = global_features[:, 0:3].argmax(dim=-1)
+        trump_suit = global_features[:, 3:7].argmax(dim=-1)
+        contract = torch.where(
+            game_kind == 0,
+            trump_suit,
+            torch.where(
+                game_kind == 1,
+                torch.full_like(game_kind, self.grand_contract),
+                torch.full_like(game_kind, self.null_contract),
+            ),
+        )
+
+        # Canonicalize all player identities relative to the acting player.
+        # 0 = SELF, 1 = next seat in engine order, 2 = previous seat.
+        current_player_id = current_player.argmax(dim=-1)
+        declarer_id = declarer.argmax(dim=-1)
+        leader_id = current_leader.argmax(dim=-1)
+        relative_declarer = (declarer_id - current_player_id) % self.num_players
+        relative_leader = (leader_id - current_player_id) % self.num_players
+
+        # Reconstruct played-card metadata from the ordered 30-slot history.
         played = history_cards.amax(dim=1) > 0.5
-        history_positions = history_cards.argmax(dim=1) + 1
-        history_positions = torch.where(
-            played,
-            history_positions,
-            torch.zeros_like(history_positions),
-        )
+        history_position = history_cards.argmax(dim=1)
+        played_trick = history_position // 3
+        played_slot = history_position % 3
+
         played_by_scores = torch.einsum("bsc,bsp->bcp", history_cards, history_players)
-        played_by = played_by_scores.argmax(dim=-1)
-        played_by = torch.where(
-            played,
-            played_by,
-            torch.full_like(played_by, self.num_players),
-        )
+        played_by_id = played_by_scores.argmax(dim=-1)
+        relative_played_by = (
+            played_by_id - current_player_id.unsqueeze(1)
+        ) % self.num_players
 
         own = own_hand > 0.5
-        card_status = torch.zeros_like(history_positions)
-        card_status = torch.where(own, torch.ones_like(card_status), card_status)
-        card_status = torch.where(played, torch.full_like(card_status, 2), card_status)
-
-        card_ids = torch.arange(self.num_cards, device=observations.device)
-        card_tokens = (
-            self.card_embedding(card_ids).unsqueeze(0)
-            + self.card_status_embedding(card_status)
-            + self.history_position_embedding(history_positions)
-            + self.played_by_embedding(played_by)
-            + self.current_trick_projection(current_trick.unsqueeze(-1))
+        card_status = torch.full_like(history_position, self.unknown_status)
+        card_status = torch.where(
+            own,
+            torch.full_like(card_status, self.own_status),
+            card_status,
+        )
+        card_status = torch.where(
+            played,
+            torch.full_like(card_status, self.played_status),
+            card_status,
         )
 
-        player_features = torch.cat(
+        # Determine effective suit/trump category for every card under this contract.
+        ranks = self.card_ranks.unsqueeze(0).expand(batch_size, -1)
+        suits = self.card_suits.unsqueeze(0).expand(batch_size, -1)
+        contract_per_card = contract.unsqueeze(1)
+
+        jack_is_trump = (ranks == self.jack_rank) & (
+            contract_per_card != self.null_contract
+        )
+        suit_card_is_trump = (
+            (contract_per_card < self.grand_contract)
+            & (suits == contract_per_card)
+        )
+        is_trump = jack_is_trump | suit_card_is_trump
+        effective_suit = torch.where(
+            is_trump,
+            torch.full_like(suits, self.trump_category),
+            suits,
+        )
+
+        # Every game state always has exactly 32 card tokens.
+        card_tokens = (
+            self.rank_embedding(ranks)
+            + self.suit_embedding(suits)
+            + self.effective_suit_embedding(effective_suit)
+            + self.card_status_embedding(card_status)
+        )
+
+        # Played metadata is conditional: unplayed cards receive exactly zero here,
+        # so no artificial NONE embeddings are needed.
+        played_metadata = (
+            self.player_embedding(relative_played_by)
+            + self.trick_embedding(played_trick)
+            + self.slot_embedding(played_slot)
+        )
+        card_tokens = card_tokens + played_metadata * played.unsqueeze(-1)
+
+        numeric_state = torch.stack(
             [
-                current_player.unsqueeze(-1),
-                current_leader.unsqueeze(-1),
-                declarer.unsqueeze(-1),
-                void_info,
+                global_features[:, 9],
+                global_features[:, 10],
+                global_features[:, 7],
             ],
             dim=-1,
         )
-        player_ids = torch.arange(self.num_players, device=observations.device)
-        player_tokens = (
-            self.player_embedding(player_ids).unsqueeze(0)
-            + self.player_projection(player_features)
+
+        state_token = self.state_token.expand(batch_size, -1, -1).squeeze(1)
+        state_token = (
+            state_token
+            + self.contract_embedding(contract)
+            + self.declarer_projection(self.player_embedding(relative_declarer))
+            + self.leader_projection(self.player_embedding(relative_leader))
+            + self.numeric_state_projection(numeric_state)
         )
 
-        state_token = self.state_token.expand(batch_size, -1, -1)
-        state_token = state_token + self.state_projection(global_features).unsqueeze(1)
-        return self.output_norm(torch.cat([state_token, player_tokens, card_tokens], dim=1))
+        tokens = torch.cat([state_token.unsqueeze(1), card_tokens], dim=1)
+        return self.output_norm(tokens)
 
 
 class SkatTransformerActorCritic(nn.Module):
+    """Card-centric shared transformer with PPO value/policy and auxiliary belief heads.
+
+    The belief head is an auxiliary supervised task only. Its logits/probabilities are
+    never fed into the policy or value heads. Belief gradients can still improve the
+    shared tokenizer/encoder representation through the joint training loss.
+    """
+
     belief_classes = 3
 
     def __init__(self, config: PPOConfig):
@@ -182,11 +313,13 @@ class SkatTransformerActorCritic(nn.Module):
             raise ValueError("transformer_heads must be at least 1.")
         if config.transformer_dim % config.transformer_heads != 0:
             raise ValueError("transformer_dim must be divisible by transformer_heads.")
-        if config.transformer_layers < 1 or config.belief_decoder_layers < 1:
-            raise ValueError("Transformer encoder and belief decoder need at least one layer.")
+        if config.transformer_layers < 1:
+            raise ValueError("Transformer encoder needs at least one layer.")
 
         model_dim = config.transformer_dim
+        self.use_belief = config.use_belief
         self.tokenizer = SkatObservationTokenizer(model_dim)
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
             nhead=config.transformer_heads,
@@ -203,64 +336,45 @@ class SkatTransformerActorCritic(nn.Module):
             enable_nested_tensor=False,
         )
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=model_dim,
-            nhead=config.transformer_heads,
-            dim_feedforward=config.transformer_ff_dim,
-            dropout=config.transformer_dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.belief_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=config.belief_decoder_layers,
-            norm=nn.LayerNorm(model_dim),
-        )
-        self.belief_queries = nn.Embedding(SkatObservationTokenizer.num_cards, model_dim)
-        self.belief_head = nn.Linear(model_dim, self.belief_classes)
-        self.belief_feature_projection = nn.Sequential(
-            nn.Linear(SkatObservationTokenizer.num_cards * self.belief_classes, model_dim),
-            nn.GELU(),
-            nn.LayerNorm(model_dim),
-        )
-        self.policy_head = _head(model_dim * 2, model_dim, config.action_dim, 0.01)
-        self.value_head = _head(model_dim * 2, model_dim, 1, 1.0)
+        # Policy and belief score each physical card from
+        # [global STATE representation, contextual CARD representation].
+        per_card_input_dim = model_dim * 2
+        self.policy_head = _head(per_card_input_dim, model_dim, 1, 0.01)
+        self.value_head = _head(model_dim, model_dim, 1, 1.0)
 
-    def outputs(self, observations, detach_beliefs=True):
-        memory = self.encoder(self.tokenizer(observations))
-        batch_size = observations.shape[0]
-        card_ids = torch.arange(
-            SkatObservationTokenizer.num_cards,
-            device=observations.device,
-        )
-        queries = (
-            self.belief_queries(card_ids)
-            + self.tokenizer.card_embedding(card_ids)
-        ).unsqueeze(0).expand(batch_size, -1, -1)
-        belief_states = self.belief_decoder(queries, memory)
-        belief_logits = self.belief_head(belief_states)
-        belief_probabilities = belief_logits.softmax(dim=-1)
-        if detach_beliefs:
-            belief_probabilities = belief_probabilities.detach()
+        if self.use_belief:
+            self.belief_head = _head(
+                per_card_input_dim,
+                model_dim,
+                self.belief_classes,
+                1.0,
+            )
 
-        own_cards = observations[:, 0:32] > 0.5
-        played_cards = observations[:, 32:992].reshape(batch_size, 30, 32).amax(dim=1) > 0.5
-        hidden_cards = ~(own_cards | played_cards)
-        belief_probabilities = belief_probabilities * hidden_cards.unsqueeze(-1)
-        belief_features = self.belief_feature_projection(
-            belief_probabilities.flatten(start_dim=1)
+    def outputs(self, observations, include_belief=True):
+        encoded = self.encoder(self.tokenizer(observations))
+        state = encoded[:, 0]
+        cards = encoded[:, 1:33]
+
+        state_per_card = state.unsqueeze(1).expand(-1, cards.shape[1], -1)
+        per_card_features = torch.cat([state_per_card, cards], dim=-1)
+
+        policy_logits = self.policy_head(per_card_features).squeeze(-1)
+        values = self.value_head(state).squeeze(-1)
+        belief_logits = (
+            self.belief_head(per_card_features)
+            if self.use_belief and include_belief
+            else None
         )
-        actor_critic_features = torch.cat([memory[:, 0], belief_features], dim=-1)
-        policy_logits = self.policy_head(actor_critic_features)
-        values = self.value_head(actor_critic_features).squeeze(-1)
+
         return policy_logits, values, belief_logits
 
-    def forward(self, observations, action_masks=None, actions=None, detach_beliefs=True):
-        logits, values, belief_logits = self.outputs(observations, detach_beliefs)
+    def forward(self, observations, action_masks=None, actions=None, include_belief=True):
+        logits, values, belief_logits = self.outputs(observations, include_belief)
         distribution = masked_categorical(logits, action_masks)
+
         if actions is None:
             actions = distribution.sample()
+
         return (
             actions,
             distribution.log_prob(actions),
@@ -270,11 +384,11 @@ class SkatTransformerActorCritic(nn.Module):
         )
 
     def value(self, observations):
-        _, values, _ = self.outputs(observations, detach_beliefs=True)
+        _, values, _ = self.outputs(observations, include_belief=False)
         return values
 
-    def policy_logits(self, observations, detach_beliefs=True):
-        logits, _, _ = self.outputs(observations, detach_beliefs)
+    def policy_logits(self, observations):
+        logits, _, _ = self.outputs(observations, include_belief=False)
         return logits
 
 
@@ -293,7 +407,6 @@ class PPOAgent:
         else:
             raise ValueError(f"Unsupported architecture: {config.architecture}")
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
-        self.updates_completed = 0
 
     @torch.no_grad()
     def act(self, observation, action_mask=None, deterministic=False):
@@ -302,7 +415,7 @@ class PPOAgent:
         if action_mask is not None:
             masks = _to_tensor(action_mask, self.device).bool().unsqueeze(0)
 
-        logits = self.model.policy_logits(observations, detach_beliefs=True)
+        logits = self.model.policy_logits(observations)
         distribution = masked_categorical(logits, masks)
         if deterministic:
             action = distribution.probs.argmax(dim=-1)
@@ -315,11 +428,11 @@ class PPOAgent:
     def get_action_and_value(self, observations, action_masks):
         observations = _to_tensor(observations, self.device).float()
         action_masks = _to_tensor(action_masks, self.device).bool()
-        actions, log_probs, _, values, _ = self.model(
-            observations,
-            action_masks,
-            detach_beliefs=True,
-        )
+        if isinstance(self.model, SkatTransformerActorCritic):
+            results = self.model(observations, action_masks, include_belief=False)
+        else:
+            results = self.model(observations, action_masks)
+        actions, log_probs, _, values, _ = results
         return (
             actions.cpu().numpy(),
             log_probs.cpu().numpy(),
@@ -333,10 +446,10 @@ class PPOAgent:
 
     @torch.no_grad()
     def get_belief_probabilities(self, observations):
-        if not isinstance(self.model, SkatTransformerActorCritic):
-            raise RuntimeError("Belief predictions require architecture='transformer'.")
+        if not isinstance(self.model, SkatTransformerActorCritic) or not self.model.use_belief:
+            raise RuntimeError("Belief predictions require a belief-enabled transformer.")
         observations = _to_tensor(observations, self.device).float()
-        _, _, belief_logits = self.model.outputs(observations, detach_beliefs=True)
+        _, _, belief_logits = self.model.outputs(observations)
         return belief_logits.softmax(dim=-1).cpu().numpy()
 
     def update(self, rollout):
@@ -348,7 +461,7 @@ class PPOAgent:
         old_values = _to_tensor(rollout.values, self.device).float()
         action_masks = _to_tensor(rollout.action_masks, self.device).bool()
         belief_targets = None
-        if rollout.belief_targets is not None:
+        if self.config.use_belief and rollout.belief_targets is not None:
             belief_targets = _to_tensor(rollout.belief_targets, self.device).long()
 
         if self.config.normalize_advantages:
@@ -368,7 +481,6 @@ class PPOAgent:
                     observations[minibatch],
                     action_masks[minibatch],
                     actions[minibatch],
-                    detach_beliefs=self.updates_completed < self.config.belief_detach_updates,
                 )
 
                 log_ratio = new_log_probs - old_log_probs[minibatch]
@@ -446,7 +558,6 @@ class PPOAgent:
             if self.config.target_kl is not None and metrics[-1]["approx_kl"] > self.config.target_kl:
                 break
 
-        self.updates_completed += 1
         return _mean_metrics(metrics)
 
     def save(self, path):
@@ -457,7 +568,6 @@ class PPOAgent:
                 "config": asdict(self.config),
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
-                "updates_completed": self.updates_completed,
             },
             path,
         )
@@ -465,12 +575,22 @@ class PPOAgent:
     @classmethod
     def load(cls, path, device: str | torch.device | None = None):
         checkpoint = torch.load(path, map_location=device or "cpu")
-        config = PPOConfig(**checkpoint["config"])
+        config_values = dict(checkpoint["config"])
+        config_values.pop("belief_decoder_layers", None)
+        config_values.pop("belief_detach_updates", None)
+        if "use_belief" not in config_values:
+            config_values["use_belief"] = config_values.get("architecture") == "transformer"
+        config = PPOConfig(**config_values)
         agent = cls(config, device=device)
-        agent.model.load_state_dict(checkpoint["model_state_dict"])
+        try:
+            agent.model.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as error:
+            raise ValueError(
+                "Checkpoint weights do not match the current model architecture. "
+                "Older transformer checkpoints cannot be resumed after the architecture change."
+            ) from error
         if "optimizer_state_dict" in checkpoint:
             agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        agent.updates_completed = int(checkpoint.get("updates_completed", 0))
         return agent
 
 
@@ -489,7 +609,7 @@ class RolloutBatch:
 
 
 class RolloutBuffer:
-    def __init__(self, rollout_steps, n_envs, observation_dim, action_dim):
+    def __init__(self, rollout_steps, n_envs, observation_dim, action_dim, use_belief=False):
         shape = (rollout_steps, n_envs)
         self.observations = np.zeros(shape + (observation_dim,), dtype=np.float32)
         self.actions = np.zeros(shape, dtype=np.int64)
@@ -498,7 +618,9 @@ class RolloutBuffer:
         self.dones = np.zeros(shape, dtype=np.float32)
         self.values = np.zeros(shape, dtype=np.float32)
         self.action_masks = np.zeros(shape + (action_dim,), dtype=bool)
-        self.belief_targets = np.full(shape + (action_dim,), -1, dtype=np.int64)
+        self.belief_targets = (
+            np.full(shape + (action_dim,), -1, dtype=np.int64) if use_belief else None
+        )
         self.advantages = np.zeros(shape, dtype=np.float32)
         self.returns = np.zeros(shape, dtype=np.float32)
 
@@ -521,7 +643,7 @@ class RolloutBuffer:
         self.dones[step] = dones
         self.values[step] = values
         self.action_masks[step] = action_masks
-        if belief_targets is not None:
+        if self.belief_targets is not None and belief_targets is not None:
             self.belief_targets[step] = belief_targets
 
     def compute_returns_and_advantages(self, last_values, last_dones, gamma, gae_lambda):
@@ -558,7 +680,10 @@ class RolloutBuffer:
             action_masks=self.action_masks.reshape(batch_size, -1),
             advantages=self.advantages.reshape(batch_size),
             returns=self.returns.reshape(batch_size),
-            belief_targets=self.belief_targets.reshape(batch_size, -1),
+            belief_targets=(
+                self.belief_targets.reshape(batch_size, -1)
+                if self.belief_targets is not None else None
+            ),
         )
 
 

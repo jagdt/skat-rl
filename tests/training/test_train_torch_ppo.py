@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -7,6 +8,39 @@ import pytest
 pytest.importorskip("torch")
 
 from skat_rl.training import train_torch_ppo  # noqa: E402
+
+
+def test_belief_cli_flag_is_explicit(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo"])
+    assert train_torch_ppo._parse_args().use_belief is False
+
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo", "--belief"])
+    assert train_torch_ppo._parse_args().use_belief is True
+
+
+def test_belief_flag_rejects_mlp_architecture(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "train_torch_ppo", "--architecture", "mlp", "--belief",
+    ])
+    with pytest.raises(ValueError, match="requires --architecture transformer"):
+        train_torch_ppo.main()
+
+
+def test_belief_flag_rejects_no_belief_checkpoint(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    config = train_torch_ppo.PPOConfig(
+        observation_dim=1149, action_dim=32, architecture="transformer",
+        transformer_dim=32, transformer_layers=1, transformer_heads=4,
+        transformer_ff_dim=64,
+    )
+    train_torch_ppo.PPOAgent(config, device="cpu").save(checkpoint)
+    monkeypatch.setattr(sys, "argv", [
+        "train_torch_ppo", "--belief", "--continue-model", str(checkpoint),
+        "--rollout-size", "1", "--output-dir", str(tmp_path),
+    ])
+
+    with pytest.raises(ValueError, match="cannot enable belief"):
+        train_torch_ppo.main()
 
 
 def test_env_seed_derives_deterministic_distinct_parallel_seeds():
@@ -132,7 +166,12 @@ def test_collect_cpp_batched_rollout_collects_complete_games():
     config = train_torch_ppo.PPOConfig(
         observation_dim=env.observation_space.shape[0],
         action_dim=env.action_space.n,
-        hidden_sizes=(8,),
+        architecture="transformer",
+        use_belief=True,
+        transformer_dim=32,
+        transformer_layers=1,
+        transformer_heads=4,
+        transformer_ff_dim=64,
     )
     agent = train_torch_ppo.PPOAgent(config, device="cpu")
 
@@ -148,3 +187,24 @@ def test_collect_cpp_batched_rollout_collects_complete_games():
     assert rollout.action_masks.shape == (20, 32)
     assert rollout.belief_targets.shape == (20, 32)
     assert set(np.unique(rollout.belief_targets)) <= {-1, 0, 1, 2}
+
+
+def test_collect_cpp_batched_rollout_without_belief_skips_targets():
+    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(
+        rollout_size=2, learning_player=0, fixed_declarer=0, seed=1,
+    )
+    config = train_torch_ppo.PPOConfig(
+        observation_dim=1149, action_dim=32, architecture="transformer",
+        use_belief=False, transformer_dim=32, transformer_layers=1,
+        transformer_heads=4, transformer_ff_dim=64,
+    )
+    agent = train_torch_ppo.PPOAgent(config, device="cpu")
+
+    rollout, episodes, global_step = train_torch_ppo._collect_cpp_batched_rollout(
+        agent, env, global_step=0,
+    )
+
+    assert global_step == 20
+    assert len(episodes) == 2
+    assert rollout.belief_targets is None
+    assert agent.update(rollout)["belief_loss"] == 0.0
