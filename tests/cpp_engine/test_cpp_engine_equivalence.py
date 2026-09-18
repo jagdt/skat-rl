@@ -1,6 +1,9 @@
 import random
 
+import pytest
+
 from skat_rl._skat_cpp import FastSkatGame
+from skat_rl.engine.cards import card_points
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.rules import points_won_by_player
 from skat_rl.engine.state import GameKind, GameState, GameType, Trick
@@ -55,10 +58,13 @@ def _deal_from_python_seed(seed):
     )
 
 
-def test_cpp_matches_python_engine_for_seeded_deals():
+@pytest.mark.parametrize("game_kind", [GameKind.SUIT, GameKind.GRAND, GameKind.NULL])
+def test_cpp_matches_python_engine_for_seeded_deals(game_kind):
     for seed in range(100):
         rng = random.Random(seed)
         hands, skat, declarer, game_type, current_player = _deal_from_python_seed(seed)
+        if game_kind != GameKind.SUIT:
+            game_type = GameType(game_kind)
         py_game = _python_game_from_deal(hands, skat, declarer, game_type, current_player)
         cpp_game = _cpp_game_from_deal(hands, skat, declarer, game_type, current_player)
 
@@ -83,10 +89,36 @@ def test_cpp_matches_python_engine_for_seeded_deals():
                 for player in range(3)
                 if player != declarer
             )
+            if not py_result.terminated:
+                assert cpp_result["declarer_points"] == cpp_game.declarer_points()
+                assert cpp_game.observation(cpp_game.current_player())[1132] == pytest.approx(
+                    points_won_by_player(py_game.state.won_cards, declarer) / 120.0
+                )
 
+        terminal_rewards = py_result.reward
         py_result = py_result.info["result"]
         cpp_terminal = cpp_result
         assert cpp_terminal["declarer_won"] == py_result["declarer_won"]
         if game_type.kind != GameKind.NULL:
             assert cpp_terminal["declarer_points"] == py_result["declarer_points"]
             assert cpp_terminal["defender_points"] == py_result["defender_points"]
+            expected_points = points_won_by_player(py_game.state.won_cards, declarer) + sum(
+                card_points(card) for card in skat
+            )
+            assert py_result["declarer_points"] == expected_points
+            assert py_result["defender_points"] == sum(
+                points_won_by_player(py_game.state.won_cards, player)
+                for player in range(3)
+                if player != declarer
+            )
+            assert py_result["declarer_won"] == (expected_points > 60)
+            expected_reward = (1.0 if expected_points > 60 else -1.0) + (
+                0.2 * (expected_points - 60) / 60.0
+            )
+            assert terminal_rewards[declarer] == pytest.approx(expected_reward)
+            for player in range(3):
+                if player != declarer:
+                    assert terminal_rewards[player] == pytest.approx(-expected_reward / 2.0)
+        else:
+            assert cpp_terminal["declarer_points"] == py_result["declarer_points"] == 0
+            assert cpp_terminal["defender_points"] == py_result["defender_points"] == 0

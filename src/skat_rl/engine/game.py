@@ -141,6 +141,7 @@ class SkatGame:
                     trick_winners=self.state.trick_winners,
                     declarer=self.state.declarer,
                     game_type=self.state.game_type,
+                    skat=self.state.skat,
                 )
 
                 info["result"] = result

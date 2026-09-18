@@ -500,7 +500,8 @@ StepInfo FastSkatGame::step(int action) {
         info.declarer_points = 0;
         info.defender_points = 0;
     } else if (terminated_) {
-        info.declarer_points = declarer_points();
+        // Include the hidden Skat only in the final score, not in observations.
+        info.declarer_points = declarer_points() + card_points(skat_[0]) + card_points(skat_[1]);
         info.defender_points = 120 - info.declarer_points;
     } else {
         info.declarer_points = declarer_points();
@@ -669,7 +670,7 @@ bool FastSkatGame::declarer_won() const {
     if (game_kind_ == NULL_GAME) {
         return !declarer_took_trick_;
     }
-    return declarer_points() > 60;
+    return declarer_points() + card_points(skat_[0]) + card_points(skat_[1]) > 60;
 }
 
 BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer)
