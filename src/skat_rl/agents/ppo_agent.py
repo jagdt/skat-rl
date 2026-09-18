@@ -103,6 +103,7 @@ class SkatObservationTokenizer(nn.Module):
     num_cards = 32
     num_players = 3
     history_slots = 30
+    num_tricks = 10
     num_ranks = 8
     num_suits = 4
 
@@ -144,7 +145,7 @@ class SkatObservationTokenizer(nn.Module):
         # Played-card metadata. No NONE categories are required; these embeddings
         # are simply added only for cards whose status is PLAYED.
         self.player_embedding = nn.Embedding(self.num_players, model_dim)
-        self.trick_embedding = nn.Embedding(10, model_dim)
+        self.trick_projection = nn.Linear(1, model_dim, bias=False)
         self.slot_embedding = nn.Embedding(3, model_dim)
 
         # Global state semantics.
@@ -213,8 +214,11 @@ class SkatObservationTokenizer(nn.Module):
         # Reconstruct played-card metadata from the ordered 30-slot history.
         played = history_cards.amax(dim=1) > 0.5
         history_position = history_cards.argmax(dim=1)
-        played_trick = history_position // 3
-        played_slot = history_position % 3
+        played_trick = history_position // self.num_players
+        played_slot = history_position % self.num_players
+        played_trick_progress = (
+            played_trick.to(observations.dtype) / (self.num_tricks - 1)
+        ).unsqueeze(-1)
 
         played_by_scores = torch.einsum("bsc,bsp->bcp", history_cards, history_players)
         played_by_id = played_by_scores.argmax(dim=-1)
@@ -266,7 +270,7 @@ class SkatObservationTokenizer(nn.Module):
         # so no artificial NONE embeddings are needed.
         played_metadata = (
             self.player_embedding(relative_played_by)
-            + self.trick_embedding(played_trick)
+            + self.trick_projection(played_trick_progress)
             + self.slot_embedding(played_slot)
         )
         card_tokens = card_tokens + played_metadata * played.unsqueeze(-1)

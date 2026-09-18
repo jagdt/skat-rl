@@ -221,6 +221,29 @@ def test_tokenizer_uses_relative_players_and_ordered_play_history():
     assert not torch.allclose(tokens[0, 1 + 6], unplayed_tokens[0, 1 + 6])
 
 
+def test_tokenizer_linearly_projects_normalized_played_trick_progress():
+    tokenizer = SkatObservationTokenizer(model_dim=16)
+    observations = np.zeros((2, 1149), dtype=np.float32)
+    observations[:, 1114] = 1.0  # Player 0 is acting.
+    observations[:, 1117] = 1.0  # Player 0 leads.
+    observations[:, 1120] = 1.0  # Player 0 is declarer.
+    observations[:, 1123] = 1.0  # Suit game.
+    observations[:, 1126] = 1.0  # Clubs trump.
+
+    card_id = 6
+    observations[0, 32 + card_id] = 1.0  # Card in trick 0, slot 0.
+    observations[0, 992] = 1.0
+
+    final_trick_history_slot = 27
+    observations[1, 32 + final_trick_history_slot * 32 + card_id] = 1.0
+    observations[1, 992 + final_trick_history_slot * 3] = 1.0
+
+    tokens = tokenizer(torch.as_tensor(observations))
+
+    assert tokens.shape == (2, 33, 16)
+    assert not torch.allclose(tokens[0, 1 + card_id], tokens[1, 1 + card_id])
+
+
 def test_transformer_outputs_policy_value_and_card_beliefs():
     agent = PPOAgent(_tiny_transformer_config(), device="cpu")
     observations = np.zeros((2, 1149), dtype=np.float32)
