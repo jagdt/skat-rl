@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, RolloutBatch, RolloutBuffer
-from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
+from skat_rl.envs.skat_python_env import SkatSingleAgentEnv
 from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 

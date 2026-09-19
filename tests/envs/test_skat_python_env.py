@@ -3,7 +3,7 @@ import pytest
 
 from skat_rl.engine.cards import Rank, Suit, make_card
 from skat_rl.engine.state import GameKind, GameType, Trick
-from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
+from skat_rl.envs.skat_python_env import SkatSingleAgentEnv
 
 
 def test_observation_matches_new_vector_shape():

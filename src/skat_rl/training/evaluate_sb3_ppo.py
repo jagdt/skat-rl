@@ -5,7 +5,7 @@ import argparse
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 
-from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
+from skat_rl.envs.skat_python_env import SkatSingleAgentEnv
 
 
 def evaluate(model_path, n_games=1000):

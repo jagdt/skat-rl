@@ -11,7 +11,7 @@ from skat_rl.agents.random_agent import RandomAgent
 
 class SkatSingleAgentEnv(gym.Env):
     """
-    Gymnasium environment for training one RL-controlled player.
+    Python-engine Gymnasium environment for training one RL-controlled player.
 
     The RL agent controls `learning_player`.
     All other players are controlled by heuristic agents.

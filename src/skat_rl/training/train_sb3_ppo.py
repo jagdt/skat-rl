@@ -16,7 +16,7 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
+from skat_rl.envs.skat_python_env import SkatSingleAgentEnv
 
 SEED_SPACING = 100_000_000
 
