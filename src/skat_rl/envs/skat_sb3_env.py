@@ -3,8 +3,8 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from skat_rl.engine.game import SkatGame
-from skat_rl.engine.state import GameKind
-from skat_rl.engine.rules import effective_suit, points_won_by_player
+from skat_rl.engine.rules import effective_suit
+from skat_rl.envs.observations import encode_observation, encode_belief_targets
 from skat_rl.agents.heuristic_agent import HeuristicAgent
 from skat_rl.agents.random_agent import RandomAgent
 
@@ -157,20 +157,7 @@ class SkatSingleAgentEnv(gym.Env):
 
     def belief_targets(self):
         """Hidden-card locations relative to the learning player."""
-        targets = np.full(32, -1, dtype=np.int64)
-        state = self.game.state
-        if state is None or state.terminated:
-            return targets
-
-        next_opponent = (self.learning_player + 1) % 3
-        previous_opponent = (self.learning_player + 2) % 3
-        for card in state.hands[next_opponent]:
-            targets[card] = 0
-        for card in state.hands[previous_opponent]:
-            targets[card] = 1
-        for card in state.skat:
-            targets[card] = 2
-        return targets
+        return encode_belief_targets(self.game.state, self.learning_player)
 
     def render(self):
         if self.game.state is None:
@@ -212,97 +199,9 @@ class SkatSingleAgentEnv(gym.Env):
         return total_reward, info
 
     def _get_observation(self):
-        if self.game.state is None:
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
-
-        state = self.game.state
-        player = self.learning_player
-
-        own_hand = np.zeros(32, dtype=np.float32)
-        for card in state.hands[player]:
-            own_hand[card] = 1.0
-
-        history_cards = np.zeros((10, 3, 32), dtype=np.float32)
-        history_players = np.zeros((10, 3, 3), dtype=np.float32)
-        tricks = list(state.completed_tricks)
-        if not state.current_trick.is_complete():
-            tricks.append(state.current_trick)
-
-        for trick_index, trick in enumerate(tricks[:10]):
-            for slot_index, (card_player, card) in enumerate(trick.cards[:3]):
-                history_cards[trick_index, slot_index, card] = 1.0
-                history_players[trick_index, slot_index, card_player] = 1.0
-
-        current_trick = np.zeros(32, dtype=np.float32)
-        for _, card in state.current_trick.cards:
-            current_trick[card] = 1.0
-
-        current_player_one_hot = np.zeros(3, dtype=np.float32)
-        current_player_one_hot[state.current_player] = 1.0
-
-        current_trick_leader = np.zeros(3, dtype=np.float32)
-        current_trick_leader[state.current_trick.leader] = 1.0
-
-        declarer_one_hot = np.zeros(3, dtype=np.float32)
-        declarer_one_hot[state.declarer] = 1.0
-
-        game_kind = np.zeros(3, dtype=np.float32)
-        if state.game_type.kind == GameKind.SUIT:
-            game_kind[0] = 1.0
-        elif state.game_type.kind == GameKind.GRAND:
-            game_kind[1] = 1.0
-        elif state.game_type.kind == GameKind.NULL:
-            game_kind[2] = 1.0
-
-        trump_suit = np.zeros(4, dtype=np.float32)
-        if state.game_type.kind == GameKind.SUIT:
-            trump_suit[int(state.game_type.trump_suit)] = 1.0
-
-        trick_number = np.array(
-            [len(state.completed_tricks) / 10.0],
-            dtype=np.float32,
+        return encode_observation(
+            self.game.state, self.learning_player, self._void_info()
         )
-
-        current_trick_position = np.array(
-            [len(state.current_trick.cards) / 3.0],
-            dtype=np.float32,
-        )
-
-        declarer_points = points_won_by_player(state.won_cards, state.declarer)
-        defender_points = sum(
-            points_won_by_player(state.won_cards, p)
-            for p in range(3)
-            if p != state.declarer
-        )
-        points = np.array(
-            [
-                declarer_points / 120.0,
-                defender_points / 120.0,
-            ],
-            dtype=np.float32,
-        )
-
-        void_info = self._void_info()
-
-        observation = np.concatenate(
-            [
-                own_hand,
-                history_cards.reshape(-1),
-                history_players.reshape(-1),
-                current_trick,
-                current_player_one_hot,
-                current_trick_leader,
-                declarer_one_hot,
-                game_kind,
-                trump_suit,
-                trick_number,
-                current_trick_position,
-                points,
-                void_info.reshape(-1),
-            ]
-        )
-
-        return observation.astype(np.float32)
 
     def _void_info(self):
         return self._void_info_cache

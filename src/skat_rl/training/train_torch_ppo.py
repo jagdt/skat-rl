@@ -2,10 +2,12 @@ import argparse
 import csv
 import json
 import math
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, RolloutBatch, RolloutBuffer
 from skat_rl.envs.skat_sb3_env import SkatSingleAgentEnv
@@ -76,7 +78,7 @@ def main():
         )
 
         if args.continue_model is None:
-            agent = PPOAgent(config, device=args.device)
+            agent = initialize_agent(config, args.init_model, args.device)
             global_step = 0
         else:
             agent = PPOAgent.load(args.continue_model, device=args.device)
@@ -469,6 +471,25 @@ def _compute_episode_advantages(rewards, values, gamma, gae_lambda):
     return advantages, returns
 
 
+def initialize_agent(config, init_model=None, device=None):
+    if init_model is None:
+        return PPOAgent(config, device=device)
+    checkpoint = torch.load(init_model, map_location="cpu", weights_only=True)
+    saved = checkpoint["config"]
+    if saved["observation_dim"] != config.observation_dim or saved["action_dim"] != config.action_dim:
+        raise ValueError("Checkpoint observation/action dimensions do not match the env.")
+    if config.use_belief and not saved.get("use_belief", False):
+        raise ValueError("--belief cannot enable belief in an existing checkpoint.")
+    architecture_fields = (
+        "architecture", "use_belief", "hidden_sizes", "activation", "transformer_dim",
+        "transformer_layers", "transformer_heads", "transformer_ff_dim", "transformer_dropout",
+    )
+    config = replace(config, **{name: saved[name] for name in architecture_fields})
+    agent = PPOAgent(config, device=device)
+    agent.model.load_state_dict(checkpoint["model_state_dict"])
+    return agent
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="Train masked PPO from scratch with PyTorch.")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
@@ -480,7 +501,9 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--env", choices=["python", "cpp"], default="cpp")
     parser.add_argument("--output-dir", default="models")
-    parser.add_argument("--continue-model")
+    checkpoint = parser.add_mutually_exclusive_group()
+    checkpoint.add_argument("--continue-model")
+    checkpoint.add_argument("--init-model", help="Initialize model weights with fresh PPO hyperparameters/optimizer.")
     parser.add_argument("--device", default=None)
     parser.add_argument("--architecture", choices=["mlp", "transformer"], default="transformer")
     parser.add_argument("--belief", dest="use_belief", action="store_true",

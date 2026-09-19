@@ -159,6 +159,7 @@ venv.bak/
 
 # Training artifacts
 models/
+data/
 
 # Spyder project settings
 .spyderproject
