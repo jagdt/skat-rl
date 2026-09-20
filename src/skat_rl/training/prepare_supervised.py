@@ -153,7 +153,7 @@ def _parse_args():
     parser.add_argument("--include-forced", action="store_true")
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--shard-size", type=int, default=8192)
+    parser.add_argument("--shard-size", type=int, default=32768)
     parser.add_argument("--max-games", type=int, help="Limit inspected records for smoke tests.")
     return parser.parse_args()
 
