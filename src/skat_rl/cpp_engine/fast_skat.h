@@ -129,12 +129,15 @@ struct BatchedStepInfo {
 
 class BatchedFastSkatEnv {
 public:
-    BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer = -1);
+    BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer = -1,
+                       bool autoplay_opponents = true);
 
     void reset(uint64_t seed);
     void reset_many(const std::vector<uint64_t>& seeds);
     BatchedStepInfo step(const std::vector<int>& actions);
     std::vector<int> active_indices() const;
+    std::vector<int> active_players() const;
+    std::vector<int> active_declarers() const;
     std::vector<float> active_observations() const;
     std::vector<uint8_t> active_action_masks() const;
     std::vector<int> active_belief_targets() const;
@@ -151,6 +154,7 @@ private:
     std::vector<int> episode_lengths_;
     int learning_player_ = 0;
     int fixed_declarer_ = -1;
+    bool autoplay_opponents_ = true;
 
     float play_until_learning_player(FastSkatGame& game);
     float reward_for_step(const FastSkatGame& game, const StepInfo& info) const;

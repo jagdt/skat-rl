@@ -18,6 +18,8 @@ def main():
     args = _parse_args()
     if args.architecture == "mlp" and args.use_belief:
         raise ValueError("--belief requires --architecture transformer.")
+    if args.opponent_model is not None and args.env != "cpp":
+        raise ValueError("--opponent-model requires --env cpp.")
     if args.env == "cpp":
         if args.rollout_size < 1:
             raise ValueError("--rollout-size must be at least 1")
@@ -37,6 +39,7 @@ def main():
             learning_player=args.learning_player,
             fixed_declarer=args.fixed_declarer,
             seed=args.seed,
+            autoplay_opponents=args.opponent_model is None,
         )
     else:
         envs = [
@@ -94,9 +97,12 @@ def main():
             ):
                 raise ValueError("--belief cannot enable belief in an existing checkpoint.")
 
+        opponent = None
+        if args.opponent_model is not None:
+            opponent = load_frozen_opponent(args.opponent_model, agent.config, agent.device)
         _save_config(output_dir, args, agent.config)
         if args.env == "cpp":
-            _train_cpp_batched(agent, envs, args, output_dir, global_step)
+            _train_cpp_batched(agent, envs, args, output_dir, global_step, opponent)
         else:
             _train_python(agent, envs, args, output_dir, global_step)
     finally:
@@ -244,7 +250,7 @@ def _train_python(agent, envs, args, output_dir, global_step):
     _save_episode_history(output_dir, completed_episodes)
 
 
-def _train_cpp_batched(agent, env, args, output_dir, global_step):
+def _train_cpp_batched(agent, env, args, output_dir, global_step, opponent=None):
     completed_episodes = []
     update = 0
     metrics_path = output_dir / "metrics.csv"
@@ -276,6 +282,7 @@ def _train_cpp_batched(agent, env, args, output_dir, global_step):
                 agent,
                 env,
                 global_step,
+                opponent,
             )
             completed_episodes.extend(episodes)
             metrics = agent.update(rollout)
@@ -309,7 +316,9 @@ def _train_cpp_batched(agent, env, args, output_dir, global_step):
     _save_episode_history(output_dir, completed_episodes)
 
 
-def _collect_cpp_batched_rollout(agent, env, global_step):
+def _collect_cpp_batched_rollout(agent, env, global_step, opponent=None):
+    if env.autoplay_opponents != (opponent is None):
+        raise ValueError("External-turn mode requires a frozen opponent; autoplay does not.")
     state = env.reset()
     use_belief = agent.config.architecture == "transformer" and agent.config.use_belief
     trajectories = {
@@ -320,28 +329,45 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
 
     while len(state["active_indices"]) > 0:
         active_indices = state["active_indices"]
-        observations = state["observations"]
-        action_masks = state["action_masks"]
-        belief_targets = state["belief_targets"] if use_belief else None
-        actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
-        step_result = env.step(actions)
-        rewards = step_result["rewards"]
-        terminated = step_result["terminated"]
+        learner_rows = np.flatnonzero(state["current_players"] == env.learning_player)
+        observations = state["observations"][learner_rows]
+        action_masks = state["action_masks"][learner_rows]
+        actions = np.empty(len(active_indices), dtype=np.int64)
+        if len(learner_rows):
+            learner_actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
+            actions[learner_rows] = learner_actions
+        if opponent is not None:
+            opponent_rows = np.flatnonzero(state["current_players"] != env.learning_player)
+            if len(opponent_rows):
+                actions[opponent_rows], _, _ = opponent.get_action_and_value(
+                    state["observations"][opponent_rows], state["action_masks"][opponent_rows],
+                )
 
-        for batch_index, env_index in enumerate(active_indices):
-            env_index = int(env_index)
+        for batch_index, row_index in enumerate(learner_rows):
+            env_index = int(active_indices[row_index])
             trajectory = trajectories[env_index]
             trajectory["observations"].append(observations[batch_index])
-            trajectory["actions"].append(int(actions[batch_index]))
+            trajectory["actions"].append(int(actions[row_index]))
             trajectory["log_probs"].append(float(log_probs[batch_index]))
-            trajectory["rewards"].append(float(rewards[batch_index]))
-            trajectory["dones"].append(float(terminated[batch_index]))
+            trajectory["rewards"].append(0.0)
+            trajectory["dones"].append(0.0)
             trajectory["values"].append(float(values[batch_index]))
             trajectory["action_masks"].append(action_masks[batch_index])
             if use_belief:
-                trajectory["belief_targets"].append(belief_targets[batch_index])
+                trajectory["belief_targets"].append(state["belief_targets"][row_index])
 
-        global_step += len(active_indices)
+        step_result = env.step(actions)
+        # A transition spans all intervening opponent moves, including a
+        # possible terminal move after the learner has played its last card.
+        for env_index, reward, done in zip(
+            step_result["env_indices"], step_result["rewards"], step_result["terminated"],
+        ):
+            trajectory = trajectories[int(env_index)]
+            if trajectory["rewards"]:
+                trajectory["rewards"][-1] += float(reward)
+                trajectory["dones"][-1] = float(done)
+
+        global_step += len(learner_rows)
 
         for episode_return, episode_length in zip(
             step_result["completed_returns"],
@@ -355,12 +381,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step):
                 }
             )
 
-        state = {
-            "active_indices": step_result["active_indices"],
-            "observations": step_result["observations"],
-            "action_masks": step_result["action_masks"],
-            "belief_targets": step_result["belief_targets"] if use_belief else None,
-        }
+        state = step_result
 
     return (
         _trajectories_to_rollout_batch(
@@ -490,6 +511,15 @@ def initialize_agent(config, init_model=None, device=None):
     return agent
 
 
+def load_frozen_opponent(path, learner_config, device=None):
+    # Reuse weight-only loading for both supervised and PPO checkpoints;
+    # the opponent does not need a saved optimizer or the learner's architecture.
+    opponent = initialize_agent(replace(learner_config, use_belief=False), path, device)
+    opponent.model.requires_grad_(False)
+    opponent.model.eval()
+    return opponent
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="Train masked PPO from scratch with PyTorch.")
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
@@ -497,13 +527,16 @@ def _parse_args():
     parser.add_argument("--n-envs", type=int, default=6)
     parser.add_argument("--rollout-size", type=int, default=2000)
     parser.add_argument("--learning-player", type=int, default=0)
-    parser.add_argument("--fixed-declarer", type=int, default=0)
+    parser.add_argument("--fixed-declarer", type=int, choices=[-1, 0, 1, 2], default=None,
+                        help="0/1/2: fixed seat. Default (or -1): heuristic declarer selection.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--env", choices=["python", "cpp"], default="cpp")
     parser.add_argument("--output-dir", default="models")
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--continue-model")
     checkpoint.add_argument("--init-model", help="Initialize model weights with fresh PPO hyperparameters/optimizer.")
+    parser.add_argument("--opponent-model",
+                        help="Frozen checkpoint controlling both other seats (C++ only).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--architecture", choices=["mlp", "transformer"], default="transformer")
     parser.add_argument("--belief", dest="use_belief", action="store_true",

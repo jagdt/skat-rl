@@ -138,6 +138,8 @@ py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
 
     const int active_count = env.active_count();
     result["active_indices"] = int_array(env.active_indices());
+    result["current_players"] = int_array(env.active_players());
+    result["declarers"] = int_array(env.active_declarers());
     result["observations"] = float_array(
         env.active_observations(),
         active_count,
@@ -218,10 +220,11 @@ PYBIND11_MODULE(_skat_cpp, m) {
 
     py::class_<skat_rl::BatchedFastSkatEnv>(m, "BatchedFastSkatEnv")
         .def(
-            py::init<int, int, int>(),
+            py::init<int, int, int, bool>(),
             py::arg("size"),
             py::arg("learning_player"),
-            py::arg("fixed_declarer") = -1
+            py::arg("fixed_declarer") = -1,
+            py::arg("autoplay_opponents") = true
         )
         .def(
             "reset",
@@ -244,6 +247,12 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("action_dim", &skat_rl::BatchedFastSkatEnv::action_dim)
         .def("active_indices", [](const skat_rl::BatchedFastSkatEnv& env) {
             return int_array(env.active_indices());
+        })
+        .def("current_players", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return int_array(env.active_players());
+        })
+        .def("declarers", [](const skat_rl::BatchedFastSkatEnv& env) {
+            return int_array(env.active_declarers());
         })
         .def("observations", [](const skat_rl::BatchedFastSkatEnv& env) {
             return float_array(

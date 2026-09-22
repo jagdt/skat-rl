@@ -17,7 +17,7 @@ class PPOConfig:
     architecture: str = "mlp"
     use_belief: bool = False
     hidden_sizes: tuple[int, ...] = (256, 256)
-    activation: str = "tanh"
+    activation: str = "gelu"
     transformer_dim: int = 256
     transformer_layers: int = 4
     transformer_heads: int = 8

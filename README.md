@@ -1,6 +1,6 @@
 # Skat-RL
 
-Skat-RL is a reinforcement-learning playground for the card game Skat. The project contains a Skat engine with card/rule utilities and random, heuristic, Stable-Baselines3 Maskable PPO, and native PyTorch PPO agents that can train and play against random and heuristic players.
+Skat-RL is a reinforcement-learning playground for the card game Skat. The project contains a Skat engine with card/rule utilities and random, heuristic, Stable-Baselines3 Maskable PPO, and native PyTorch PPO agents. Native PPO also supports batched C++ self-play against a frozen trained policy.
 
 ## Architecture
 
@@ -121,8 +121,55 @@ resume behavior. These options are mutually exclusive. Pretrained checkpoints al
 load with `PPOAgent.load()` for evaluation. They omit optimizer state and do not
 support resuming the supervised optimizer/epoch counter.
 
-## Outlook
+## Self-Play
 
-This is an experimental project. Things that might be implemented in the future:
+Train against a preselected transformer checkpoint, using the same supervised
+checkpoint as the learner's starting point if desired:
 
-- Self-play of RL agents
+```bash
+python -m skat_rl.training.train_torch_ppo \
+  --env cpp \
+  --init-model models/skat_pretrained/best.pt \
+  --opponent-model models/skat_pretrained/best.pt \
+  --rollout-size 512 --learning-rate 0.0001
+```
+
+Declarer selection defaults to the existing hand heuristic in all native PPO runs:
+choose the largest `number_of_jacks + number_of_aces + 0.4 * number_of_tens`
+(ties go to the lowest seat). This is a simple proxy for hand strength, not a
+calibrated win-probability estimate. The existing trump-suit heuristic is retained.
+Games remain suit card-play games without bidding or Skat pickup/discard decisions.
+The learning seat stays fixed (`--learning-player`, default 0), but its role changes
+with the deal. `--fixed-declarer 0`, `1`, or `2` instead filters deals until that
+seat is selected. Without `--opponent-model`, heuristic card-play opponents are
+used, with the same heuristic declarer selection. `--fixed-declarer -1` remains
+an explicit alias for the default heuristic selection.
+
+
+### Batched Turn Interface
+
+`SkatCppBatchedSingleAgentEnv(..., autoplay_opponents=False)` exposes every turn:
+
+- `reset()` deals games without autoplaying any cards.
+- State arrays contain `active_indices`, `current_players`, `declarers`,
+  `observations`, `action_masks`, and `belief_targets`.
+- Each observation, mask, and belief target belongs to that row's current player.
+  Belief targets are privileged supervision labels, never policy inputs.
+- `step(actions)` takes one integer action per active row and plays one card in
+  each game inside C++. The entire action batch is validated before any mutation.
+- `env_indices`, `rewards`, and `terminated` describe the submitted rows;
+  `active_indices` and the new observation arrays describe the surviving games.
+  Rewards always use the configured learning player's perspective, regardless
+  of who acted. Completed games disappear from subsequent active batches.
+
+The collector groups current-player observations by learner/frozen policy, performs
+at most one forward pass per nonempty policy group, and submits a single combined
+action batch. Different games may have different players to act. Python performs
+trajectory bookkeeping but does not loop over individual games to step the engine.
+The default `autoplay_opponents=True` preserves the heuristic-opponent interface.
+
+After changing C++ sources, rebuild the extension before running:
+
+```bash
+python setup.py build_ext --inplace
+```

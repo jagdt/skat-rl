@@ -673,13 +673,15 @@ bool FastSkatGame::declarer_won() const {
     return declarer_points() + card_points(skat_[0]) + card_points(skat_[1]) > 60;
 }
 
-BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer)
+BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer,
+                                     bool autoplay_opponents)
     : games_(size),
       active_(size, 0),
       episode_returns_(size, 0.0F),
       episode_lengths_(size, 0),
       learning_player_(learning_player),
-      fixed_declarer_(fixed_declarer) {
+      fixed_declarer_(fixed_declarer),
+      autoplay_opponents_(autoplay_opponents) {
     if (size < 1) {
         throw std::invalid_argument("BatchedFastSkatEnv size must be at least 1.");
     }
@@ -712,7 +714,9 @@ void BatchedFastSkatEnv::reset_many(const std::vector<uint64_t>& seeds) {
         active_[index] = 1;
         episode_returns_[index] = 0.0F;
         episode_lengths_[index] = 0;
-        play_until_learning_player(games_[index]);
+        if (autoplay_opponents_) {
+            play_until_learning_player(games_[index]);
+        }
         if (games_[index].is_terminal()) {
             active_[index] = 0;
         }
@@ -723,6 +727,16 @@ BatchedStepInfo BatchedFastSkatEnv::step(const std::vector<int>& actions) {
     const std::vector<int> indices = active_indices();
     if (actions.size() != indices.size()) {
         throw std::invalid_argument("actions length must equal active environment count.");
+    }
+
+    // Validate the entire batch before mutating any game.
+    for (std::size_t batch_index = 0; batch_index < indices.size(); ++batch_index) {
+        const FastSkatGame& game = games_[indices[batch_index]];
+        const int action = actions[batch_index];
+        if (action < 0 || action >= kNumCards
+            || (game.legal_mask_bits() & (uint32_t{1} << action)) == 0) {
+            throw std::invalid_argument("Batch contains an illegal action.");
+        }
     }
 
     BatchedStepInfo result;
@@ -737,18 +751,19 @@ BatchedStepInfo BatchedFastSkatEnv::step(const std::vector<int>& actions) {
         if (game.is_terminal()) {
             throw std::runtime_error("Cannot step a terminated active environment.");
         }
-        if (game.current_player() != learning_player_) {
+        if (autoplay_opponents_ && game.current_player() != learning_player_) {
             throw std::runtime_error("Active environment is not at the learning player's turn.");
         }
 
+        const bool learner_acted = game.current_player() == learning_player_;
         StepInfo step_info = game.step(actions[batch_index]);
         float reward = reward_for_step(game, step_info);
-        if (!game.is_terminal()) {
+        if (autoplay_opponents_ && !game.is_terminal()) {
             reward += play_until_learning_player(game);
         }
 
         episode_returns_[env_index] += reward;
-        episode_lengths_[env_index] += 1;
+        episode_lengths_[env_index] += learner_acted ? 1 : 0;
 
         const bool done = game.is_terminal();
         result.rewards.push_back(reward);
@@ -781,10 +796,27 @@ std::vector<float> BatchedFastSkatEnv::active_observations() const {
     std::vector<float> observations;
     observations.reserve(indices.size() * kObservationDim);
     for (int env_index : indices) {
-        std::vector<float> observation = games_[env_index].observation(learning_player_);
+        const FastSkatGame& game = games_[env_index];
+        std::vector<float> observation = game.observation(game.current_player());
         observations.insert(observations.end(), observation.begin(), observation.end());
     }
     return observations;
+}
+
+std::vector<int> BatchedFastSkatEnv::active_players() const {
+    std::vector<int> players;
+    for (int env_index : active_indices()) {
+        players.push_back(games_[env_index].current_player());
+    }
+    return players;
+}
+
+std::vector<int> BatchedFastSkatEnv::active_declarers() const {
+    std::vector<int> declarers;
+    for (int env_index : active_indices()) {
+        declarers.push_back(games_[env_index].declarer());
+    }
+    return declarers;
 }
 
 std::vector<uint8_t> BatchedFastSkatEnv::active_action_masks() const {
@@ -805,7 +837,8 @@ std::vector<int> BatchedFastSkatEnv::active_belief_targets() const {
     std::vector<int> targets;
     targets.reserve(indices.size() * kNumCards);
     for (int env_index : indices) {
-        std::vector<int> game_targets = games_[env_index].belief_targets(learning_player_);
+        const FastSkatGame& game = games_[env_index];
+        std::vector<int> game_targets = game.belief_targets(game.current_player());
         targets.insert(targets.end(), game_targets.begin(), game_targets.end());
     }
     return targets;

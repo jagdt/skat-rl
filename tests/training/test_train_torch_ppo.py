@@ -1,11 +1,12 @@
 import argparse
+import csv
 import json
 import sys
 
 import numpy as np
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from skat_rl.training import train_torch_ppo  # noqa: E402
 
@@ -208,3 +209,158 @@ def test_collect_cpp_batched_rollout_without_belief_skips_targets():
     assert len(episodes) == 2
     assert rollout.belief_targets is None
     assert agent.update(rollout)["belief_loss"] == 0.0
+
+
+@pytest.mark.parametrize("learning_player", [0, 1, 2])
+def test_fixed_opponent_collection_batches_policies_and_credits_terminal_reward(learning_player):
+    class RecordingPolicy:
+        config = train_torch_ppo.PPOConfig(
+            observation_dim=1149, action_dim=32, architecture="transformer",
+            use_belief=True, gamma=1.0, gae_lambda=1.0,
+        )
+
+        def __init__(self):
+            self.observations = []
+
+        def get_action_and_value(self, observations, masks):
+            assert len(observations) > 0
+            self.observations.append(observations.copy())
+            return masks.argmax(axis=1), np.zeros(len(masks)), np.zeros(len(masks))
+
+    learner, opponent = RecordingPolicy(), RecordingPolicy()
+    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(
+        12, learning_player=learning_player, seed=17, autoplay_opponents=False,
+    )
+    rollout, episodes, steps = train_torch_ppo._collect_cpp_batched_rollout(
+        learner, env, 7, opponent,
+    )
+    assert steps == 127
+    assert len(episodes) == 12
+    assert all(episode["length"] == 10 for episode in episodes)
+    assert sum(len(batch) for batch in learner.observations) == 120
+    assert sum(len(batch) for batch in opponent.observations) == 240
+    assert len(learner.observations) <= 30
+    assert len(opponent.observations) <= 30
+    assert max(map(len, opponent.observations)) == 12
+    learner_players = np.concatenate(learner.observations)[:, 1114:1117].argmax(axis=1)
+    opponent_players = np.concatenate(opponent.observations)[:, 1114:1117].argmax(axis=1)
+    assert (learner_players == learning_player).all()
+    assert (opponent_players != learning_player).all()
+    assert (rollout.observations[:, 1114:1117].argmax(axis=1) == learning_player).all()
+    assert rollout.action_masks[np.arange(120), rollout.actions].all()
+    assert rollout.belief_targets.shape == (120, 32)
+    assert (rollout.belief_targets[np.arange(120), rollout.actions] == -1).all()
+    rewards = rollout.rewards.reshape(12, 10)
+    assert (rewards[:, :-1] == 0).all()
+    np.testing.assert_allclose(rewards[:, -1], [ep["return"] for ep in episodes])
+    assert (rollout.dones.reshape(12, 10)[:, :-1] == 0).all()
+    assert (rollout.dones.reshape(12, 10)[:, -1] == 1).all()
+    np.testing.assert_allclose(rollout.returns.reshape(12, 10), np.repeat(rewards[:, -1:], 10, axis=1))
+
+
+def _small_transformer_config(**overrides):
+    values = dict(
+        observation_dim=1149, action_dim=32, architecture="transformer",
+        transformer_dim=16, transformer_layers=1, transformer_heads=2,
+        transformer_ff_dim=32, update_epochs=1, minibatch_size=20,
+    )
+    return train_torch_ppo.PPOConfig(**(values | overrides))
+
+
+@pytest.mark.parametrize("supervised_checkpoint", [False, True])
+def test_frozen_opponent_is_unchanged_by_ppo_training(tmp_path, supervised_checkpoint):
+    from skat_rl.training.train_supervised import save_pretrained
+
+    torch.set_num_threads(1)
+    source = train_torch_ppo.PPOAgent(
+        _small_transformer_config(transformer_dropout=0.5, use_belief=True), device="cpu",
+    )
+    path = tmp_path / "opponent.pt"
+    if supervised_checkpoint:
+        save_pretrained(source, path, epoch=1)
+    else:
+        source.save(path)
+    learner = train_torch_ppo.PPOAgent(
+        _small_transformer_config(transformer_dim=32), device="cpu",
+    )
+    opponent = train_torch_ppo.load_frozen_opponent(path, learner.config, "cpu")
+    assert opponent.config.transformer_dim == 16
+    assert not opponent.model.training
+    assert all(not p.requires_grad for p in opponent.model.parameters())
+    before = {name: value.clone() for name, value in opponent.model.state_dict().items()}
+    learner_before = {name: value.clone() for name, value in learner.model.state_dict().items()}
+    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(4, autoplay_opponents=False)
+    rollout, episodes, steps = train_torch_ppo._collect_cpp_batched_rollout(
+        learner, env, 0, opponent,
+    )
+    assert steps == 40
+    assert len(episodes) == 4
+    assert rollout.belief_targets is None
+    metrics = learner.update(rollout)
+    assert np.isfinite(metrics["loss"])
+    assert all(torch.equal(before[n], p) for n, p in opponent.model.state_dict().items())
+    assert all(p.grad is None for p in opponent.model.parameters())
+    assert not opponent.model.training
+    assert any(not torch.equal(learner_before[n], p) for n, p in learner.model.state_dict().items())
+
+
+@pytest.mark.parametrize("arguments,expected", [
+    ([], None),
+    (["--env", "python"], None),
+    (["--fixed-declarer", "0"], 0),
+    (["--fixed-declarer", "1"], 1),
+    (["--opponent-model", "frozen.pt"], None),
+    (["--opponent-model", "frozen.pt", "--fixed-declarer", "2"], 2),
+    (["--fixed-declarer", "-1"], None),
+])
+def test_declarer_cli_defaults_and_overrides(monkeypatch, arguments, expected):
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo", *arguments])
+    assert train_torch_ppo._parse_args().fixed_declarer == expected
+
+
+def test_python_env_rejects_neural_opponents(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "train_torch_ppo", "--env", "python", "--opponent-model", "frozen.pt",
+    ])
+    with pytest.raises(ValueError, match="requires --env cpp"):
+        train_torch_ppo.main()
+
+
+def test_opponent_checkpoint_rejects_incompatible_dimensions(tmp_path):
+    path = tmp_path / "bad.pt"
+    train_torch_ppo.PPOAgent(train_torch_ppo.PPOConfig(
+        observation_dim=5, action_dim=2, hidden_sizes=(8,),
+    ), device="cpu").save(path)
+    with pytest.raises(ValueError, match="dimensions do not match"):
+        train_torch_ppo.load_frozen_opponent(path, _small_transformer_config(), "cpu")
+
+
+def test_fixed_opponent_cli_trains_and_saves_run(tmp_path, monkeypatch):
+    from skat_rl.training.train_supervised import save_pretrained
+
+    torch.set_num_threads(1)
+    pretrained = train_torch_ppo.PPOAgent(_small_transformer_config(), device="cpu")
+    path = tmp_path / "pretrained.pt"
+    save_pretrained(pretrained, path, epoch=1)
+    original = path.read_bytes()
+    monkeypatch.setattr(sys, "argv", [
+        "train_torch_ppo", "--init-model", str(path), "--opponent-model", str(path),
+        "--env", "cpp", "--rollout-size", "2", "--total-timesteps", "40",
+        "--update-epochs", "1", "--minibatch-size", "20", "--device", "cpu",
+        "--output-dir", str(tmp_path / "runs"),
+    ])
+    train_torch_ppo.main()
+    run = next((tmp_path / "runs").iterdir())
+    assert (run / "model.pt").is_file()
+    assert path.read_bytes() == original
+    config = json.loads((run / "config.json").read_text())
+    assert config["args"]["fixed_declarer"] is None
+    assert config["args"]["opponent_model"] == str(path)
+    with (run / "metrics.csv").open() as handle:
+        metrics = list(csv.DictReader(handle))
+    assert [int(row["total_timesteps"]) for row in metrics] == [20, 40]
+    assert all(np.isfinite(float(row["loss"])) for row in metrics)
+    with (run / "episodes.csv").open() as handle:
+        episodes = list(csv.DictReader(handle))
+    assert len(episodes) == 4
+    assert all(int(row["length"]) == 10 for row in episodes)

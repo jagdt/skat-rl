@@ -87,3 +87,18 @@ def test_random_cpp_game_terminates_after_30_card_plays():
     assert game.trick_index() == 10
     if game.state_summary()["game_kind"] != 2:
         assert result["declarer_points"] + result["defender_points"] == 120
+
+
+def test_reset_selects_best_scoring_hand_as_declarer():
+    game = FastSkatGame()
+    selected = set()
+    for seed in range(100):
+        game.reset(seed)
+        scores = [
+            sum(1.0 if card % 8 in (6, 7) else 0.4 if card % 8 == 5 else 0.0
+                for card in game.hand(player))
+            for player in range(3)
+        ]
+        assert game.declarer() == max(range(3), key=lambda player: scores[player])
+        selected.add(game.declarer())
+    assert selected == {0, 1, 2}
