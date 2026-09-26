@@ -20,6 +20,7 @@ py::dict step_info_to_dict(const skat_rl::StepInfo& info) {
     result["trick_index"] = info.trick_index;
     result["declarer_points"] = info.declarer_points;
     result["defender_points"] = info.defender_points;
+    result["game_value"] = info.game_value;
     if (info.declarer_won.has_value()) {
         result["declarer_won"] = info.declarer_won.value();
     } else {
@@ -191,7 +192,8 @@ PYBIND11_MODULE(_skat_cpp, m) {
             py::arg("declarer"),
             py::arg("game_kind"),
             py::arg("trump_suit"),
-            py::arg("current_player") = 0
+            py::arg("current_player") = 0,
+            py::arg("hand_game") = false
         )
         .def("legal_actions", &skat_rl::FastSkatGame::legal_actions)
         .def("legal_mask_bits", &skat_rl::FastSkatGame::legal_mask_bits)

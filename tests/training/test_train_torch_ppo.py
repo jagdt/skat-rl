@@ -267,6 +267,60 @@ def _small_transformer_config(**overrides):
     return train_torch_ppo.PPOConfig(**(values | overrides))
 
 
+@pytest.mark.parametrize("architecture", ["mlp", "transformer"])
+def test_old_rewards_transfer_policy_but_reset_value_network(tmp_path, architecture):
+    config = _small_transformer_config(architecture=architecture, hidden_sizes=(16,))
+    source = train_torch_ppo.PPOAgent(config, device="cpu")
+    path = tmp_path / "legacy.pt"
+    source.save(path)
+    checkpoint = torch.load(path, weights_only=True)
+    del checkpoint["config"]["reward_scheme"]
+    torch.save(checkpoint, path)
+
+    assert train_torch_ppo.PPOAgent.load(path, "cpu").config.reward_scheme == "legacy_v1"
+    torch.manual_seed(123)
+    fresh = train_torch_ppo.PPOAgent(config, device="cpu")
+    torch.manual_seed(123)
+    with pytest.warns(UserWarning, match="fresh value head"):
+        learner = train_torch_ppo.initialize_agent(config, path, "cpu")
+    assert learner.config.reward_scheme == train_torch_ppo.REWARD_SCHEME
+    assert not learner.optimizer.state
+    for name, value in learner.model.state_dict().items():
+        expected = (fresh.model.state_dict()[name] if name.startswith(("value_head.", "value_net."))
+                    else source.model.state_dict()[name])
+        assert torch.equal(value, expected), name
+
+    opponent = train_torch_ppo.load_frozen_opponent(path, config, "cpu")
+    for name, value in opponent.model.state_dict().items():
+        assert torch.equal(value, source.model.state_dict()[name]), name
+
+
+def test_continue_model_rejects_old_reward_scheme(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.pt"
+    train_torch_ppo.PPOAgent(
+        _small_transformer_config(reward_scheme="legacy_v1"), device="cpu",
+    ).save(path)
+    monkeypatch.setattr(sys, "argv", [
+        "train_torch_ppo", "--continue-model", str(path), "--rollout-size", "1",
+        "--output-dir", str(tmp_path / "runs"), "--device", "cpu",
+    ])
+    with pytest.raises(ValueError, match="old rewards.*--init-model"):
+        train_torch_ppo.main()
+
+
+def test_pretrained_critic_warns_about_changed_discount(tmp_path):
+    from skat_rl.training.train_supervised import save_pretrained
+
+    source = train_torch_ppo.PPOAgent(_small_transformer_config(gamma=1.0), device="cpu")
+    path = tmp_path / "pretrained.pt"
+    save_pretrained(source, path, epoch=1)
+    with pytest.warns(UserWarning, match="different gamma"):
+        learner = train_torch_ppo.initialize_agent(_small_transformer_config(gamma=.99), path, "cpu")
+    assert learner.config.gamma == .99
+    for name, value in learner.model.state_dict().items():
+        assert torch.equal(value, source.model.state_dict()[name]), name
+
+
 @pytest.mark.parametrize("supervised_checkpoint", [False, True])
 def test_frozen_opponent_is_unchanged_by_ppo_training(tmp_path, supervised_checkpoint):
     from skat_rl.training.train_supervised import save_pretrained

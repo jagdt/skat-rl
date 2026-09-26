@@ -1,5 +1,7 @@
 import argparse
 import bz2
+import json
+import sys
 
 import numpy as np
 import pytest
@@ -12,7 +14,9 @@ from skat_rl.envs.observations import encode_observation
 from skat_rl.training.iss_data import (
     RecordError, decode_game, open_records, parse_record, player_rating, replay_examples,
 )
-from skat_rl.training.prepare_supervised import prepare_dataset, session_split
+from skat_rl.training.prepare_supervised import (
+    _parse_args as parse_prepare_args, prepare_dataset, session_split,
+)
 from skat_rl.training.train_supervised import SupervisedBatches, run_epoch, train
 from skat_rl.training.train_torch_ppo import initialize_agent
 
@@ -35,7 +39,7 @@ def generated_record(seed):
         return "CSHD"[card // 8] + "789QKTAJ"[card % 8]
 
     game = SkatGame()
-    state = game.reset(game_type=GameType(GameKind.GRAND), declarer=seed % 3, seed=seed)
+    state = game.reset(game_type=GameType(GameKind.GRAND, hand=True), declarer=seed % 3, seed=seed)
     deck = [c for hand in state.hands for c in sorted(hand)] + state.skat
     moves = ["w", ".".join(map(code, deck)), str(state.declarer), "GH"]
     while not state.terminated:
@@ -52,8 +56,8 @@ def generated_record(seed):
 
 def prepare_args(path, output, **overrides):
     values = dict(inputs=[str(path)], output_dir=str(output), min_rating=1000,
-                  min_prior_games=0, trusted_players=[], role="both", game_kinds=["suit", "grand"],
-                  include_forced=False, validation_fraction=0.3, seed=42, shard_size=64, max_games=None)
+                  min_prior_games=0, role="both", game_kinds=["suit", "grand"],
+                  include_forced=True, validation_fraction=0.3, seed=42, shard_size=64, max_games=None)
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -65,6 +69,18 @@ def prepared(tmp_path):
     directory = tmp_path / "prepared"
     manifest = prepare_dataset(prepare_args(source, directory))
     return directory, manifest
+
+
+@pytest.mark.parametrize("arguments,expected", [
+    ([], True), (["--include-forced"], True), (["--no-include-forced"], False),
+])
+def test_prepare_cli_includes_forced_by_default(monkeypatch, arguments, expected):
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_supervised", "games.sgf", "--output-dir", "prepared", *arguments,
+    ])
+    args = parse_prepare_args()
+    assert args.include_forced is expected
+    assert not hasattr(args, "trusted_players")
 
 
 def test_parser_preserves_escaped_properties_and_unknown_rating():
@@ -79,8 +95,10 @@ def test_parser_preserves_escaped_properties_and_unknown_rating():
 def test_real_record_replays_pickup_discards_and_teacher_selection():
     record = decode_game(parse_record(RECORDED_GAME))
     assert record.game.state.skat == [25, 27]  # D8 and DQ were discarded.
-    examples = replay_examples(record, [False, False, True], include_forced=True)
+    examples = replay_examples(record, [False, False, True])
     assert len(examples) == 10
+    assert [e["remaining_decisions"] for e in examples] == list(range(9, -1, -1))
+    assert [e["terminal_rewards"] for e in examples] == pytest.approx([0.98] * 10)
     assert all(example["observations"][1116] == 1 for example in examples)
     for example in examples:
         assert example["action_masks"][example["actions"]]
@@ -154,29 +172,52 @@ def test_shards_exclude_weak_players_and_keep_games_in_one_split(prepared):
             with np.load(directory / shard["file"]) as data:
                 identities[split].update(data["game_ids"].tolist())
                 assert np.all(data["observations"][:, 1115] == 0)  # Bob is below 1000.
-                assert np.all(data["action_masks"].sum(axis=1) > 1)
+                assert np.all(data["action_masks"].sum(axis=1) >= 1)
                 count += len(data["actions"])
         assert count == manifest["counts"][f"{split}_examples"]
+        assert count == 20 * manifest["counts"][f"{split}_games"]
+    assert manifest["args"]["include_forced"] is True
+    assert "trusted_players" not in manifest["args"]
     assert not identities["train"] & identities["validation"]
     assert session_split("test", "same-session", 42, .3) == session_split("test", "same-session", 42, .3)
 
 
-def test_prior_games_filter_and_trusted_override(tmp_path):
+def test_rating_and_history_filters_apply_to_formerly_trusted_names(tmp_path):
+    source = tmp_path / "games.sgf"
+    records = "".join(generated_record(seed) for seed in range(20))
+    records = (records.replace("P0[alice]", "P0[kermit]").replace("P1[bob]", "P1[zoot]")
+               .replace("P2[carol]", "P2[theCount]").replace("R2[1100]", "R2[?]"))
+    source.write_text(records)
+    output = tmp_path / "prior"
+    manifest = prepare_dataset(prepare_args(source, output, min_prior_games=5))
+    assert manifest["counts"]["skipped_no_eligible_player"] == 5
+    assert manifest["counts"]["train_games"] + manifest["counts"]["validation_games"] == 15
+    for split in ("train", "validation"):
+        assert manifest["counts"][f"{split}_examples"] == 10 * manifest["counts"][f"{split}_games"]
+        for shard in manifest["splits"][split]:
+            with np.load(output / shard["file"]) as data:
+                assert np.all(data["observations"][:, 1114] == 1)  # Only the rated, eligible player.
+
+
+def test_prepare_can_exclude_forced_moves(tmp_path):
     source = tmp_path / "games.sgf"
     source.write_text("".join(generated_record(seed) for seed in range(20)))
-    manifest = prepare_dataset(prepare_args(source, tmp_path / "prior", min_prior_games=5))
-    assert manifest["counts"]["skipped_no_eligible_player"] == 5
-    trusted = prepare_dataset(prepare_args(source, tmp_path / "trusted", min_prior_games=100,
-                                          trusted_players=["bob"]))
-    assert trusted["counts"]["train_games"] + trusted["counts"]["validation_games"] == 20
+    output = tmp_path / "decisions"
+    manifest = prepare_dataset(prepare_args(source, output, include_forced=False))
+    for split in ("train", "validation"):
+        assert manifest["counts"][f"{split}_examples"] < 20 * manifest["counts"][f"{split}_games"]
+        for shard in manifest["splits"][split]:
+            with np.load(output / shard["file"]) as data:
+                assert np.all(data["action_masks"].sum(axis=1) > 1)
 
 
-def test_supervised_epoch_updates_policy_but_not_value_head(prepared):
+@pytest.mark.parametrize("value_coef", [0.0, 0.5])
+def test_supervised_epoch_updates_policy_and_optional_value_head(prepared, value_coef):
     torch.set_num_threads(1)
     directory, _ = prepared
     config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
                        transformer_dim=16, transformer_layers=1, transformer_heads=2,
-                       transformer_ff_dim=32, use_belief=True)
+                       transformer_ff_dim=32, use_belief=True, value_coef=value_coef)
     agent = PPOAgent(config, device="cpu")
     before = {name: p.detach().clone() for name, p in agent.model.named_parameters()}
     dataset = SupervisedBatches(directory, "train", batch_size=32)
@@ -185,8 +226,10 @@ def test_supervised_epoch_updates_policy_but_not_value_head(prepared):
     assert metrics["belief_loss"] > 0
     assert any(not torch.equal(before[n], p) for n, p in agent.model.named_parameters()
                if n.startswith("policy_head."))
-    assert all(torch.equal(before[n], p) for n, p in agent.model.named_parameters()
-               if n.startswith("value_head."))
+    value_changed = any(not torch.equal(before[n], p) for n, p in agent.model.named_parameters()
+                        if n.startswith("value_head."))
+    assert value_changed == (value_coef > 0)
+    assert (metrics["value_loss"] > 0) == (value_coef > 0)
 
 
 def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared, tmp_path):
@@ -195,9 +238,11 @@ def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared,
                               batch_size=32, patience=2, workers=0, torch_threads=1, seed=42,
                               device="cpu", transformer_dim=16, transformer_layers=1,
                               transformer_heads=2, transformer_ff_dim=32, transformer_dropout=0.0,
-                              learning_rate=1e-3, belief=False, belief_coef=.05)
+                              learning_rate=1e-3, belief=False, belief_coef=.05,
+                              gamma=.95, value_coef=.5)
     path = train(args)
     loaded = PPOAgent.load(path, device="cpu")
+    assert torch.load(path, weights_only=True)["critic_pretrained"] is True
     config = PPOConfig(observation_dim=1149, action_dim=32, learning_rate=2e-4, gamma=.95)
     ppo = initialize_agent(config, path, device="cpu")
     assert ppo.config.transformer_dim == 16
@@ -219,3 +264,55 @@ def test_multiple_loader_workers_do_not_repeat_examples(prepared):
         with patch("skat_rl.training.train_supervised.get_worker_info", return_value=worker):
             counts.append(sum(len(batch["actions"]) for batch in dataset))
     assert sum(counts) == manifest["counts"]["train_examples"]
+
+
+def test_outcomes_are_discounted_by_player_decisions_not_selected_examples():
+    record = decode_game(parse_record(RECORDED_GAME))
+    selected = replay_examples(record, [False, False, True], include_forced=False)
+    assert len(selected) < 10
+    for example in selected:
+        assert example["remaining_decisions"] == sum(example["observations"][:32]) - 1
+        assert example["terminal_rewards"] == pytest.approx(.98)
+
+
+def test_value_loss_uses_discounted_outcome(prepared):
+    directory, _ = prepared
+    config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
+                       transformer_dim=16, transformer_layers=1, transformer_heads=2,
+                       transformer_ff_dim=32, gamma=.8)
+    agent = PPOAgent(config, device="cpu")
+    agent.model.eval()
+    batch = next(iter(SupervisedBatches(directory, "train", 32)))
+    with torch.no_grad():
+        predicted = agent.model.outputs(batch["observations"])[1]
+        targets = batch["terminal_rewards"] * .8 ** batch["remaining_decisions"].float()
+        expected = .5 * ((predicted - targets) ** 2).mean().item()
+    before = {name: p.clone() for name, p in agent.model.state_dict().items()}
+    metrics = run_epoch(agent, [batch], training=False)
+    assert metrics["value_loss"] == pytest.approx(expected)
+    assert metrics["loss"] == pytest.approx(metrics["policy_loss"] + .5 * expected)
+    assert all(torch.equal(before[n], p) for n, p in agent.model.state_dict().items())
+
+
+def test_legacy_shards_require_repreparation_for_value_training(prepared):
+    directory, manifest = prepared
+    manifest["format_version"] = 1
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="no outcome labels"):
+        SupervisedBatches(directory, "train", 32)
+    batch = next(iter(SupervisedBatches(directory, "train", 32, require_value_targets=False)))
+    assert "terminal_rewards" not in batch
+
+
+def test_dataset_reward_scheme_must_match_ppo(prepared):
+    directory, manifest = prepared
+    manifest["reward_scheme"] = "other"
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="reward scheme"):
+        SupervisedBatches(directory, "train", 32)
+
+
+def test_replay_checks_recorded_game_value():
+    record = decode_game(parse_record(RECORDED_GAME.replace("v:48", "v:49")))
+    with pytest.raises(RecordError, match="game_value_mismatch"):
+        replay_examples(record, [True] * 3)

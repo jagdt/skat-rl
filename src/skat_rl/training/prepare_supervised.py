@@ -10,7 +10,7 @@ import sqlite3
 import numpy as np
 
 from skat_rl.training.iss_data import (
-    TRUSTED_PLAYERS, RecordError, base_player_name, decode_game, open_records,
+    RecordError, base_player_name, decode_game, open_records,
     parse_record, player_rating, replay_examples,
 )
 
@@ -34,7 +34,8 @@ class ShardWriter:
             return
         filename = f"{self.split}-{len(self.shards):05d}.npz"
         dtypes = {"observations": np.float32, "action_masks": bool, "actions": np.uint8,
-                  "belief_targets": np.int8, "game_ids": str}
+                  "belief_targets": np.int8, "game_ids": str,
+                  "terminal_rewards": np.float32, "remaining_decisions": np.uint8}
         arrays = {key: np.asarray([r[key] for r in self.rows], dtype=dtype)
                   for key, dtype in dtypes.items()}
         np.savez_compressed(self.directory / filename, **arrays)
@@ -65,7 +66,6 @@ def prepare_dataset(args):
     counts = Counter()
     prior_games = Counter()
     errors = []
-    trusted = set(args.trusted_players)
 
     # On-disk identity indexes keep deduplication memory bounded for large archives.
     with sqlite3.connect(output / "identities.sqlite") as database:
@@ -91,10 +91,10 @@ def prepare_dataset(args):
                         eligible = []
                         for player, name in enumerate(names):
                             rating = player_rating(properties, player)
-                            eligible.append(name in trusted or (
+                            eligible.append(
                                 rating is not None and rating >= args.min_rating
                                 and prior_games[(properties["PC"], name)] >= args.min_prior_games
-                            ))
+                            )
                         for name in set(names):
                             prior_games[(properties["PC"], name)] += 1
                         if not any(eligible):
@@ -127,7 +127,7 @@ def prepare_dataset(args):
     for writer in writers.values():
         writer.flush()
     manifest = {
-        "format_version": 1, "observation_dim": 1149, "action_dim": 32,
+        "format_version": 2, "observation_dim": 1149, "action_dim": 32,
         "args": vars(args), "counts": dict(counts), "error_examples": errors,
         "splits": {split: writer.shards for split, writer in writers.items()},
     }
@@ -145,12 +145,11 @@ def _parse_args():
     parser.add_argument("inputs", nargs="+", help="Chronologically ordered .sgf or .sgf.bz2 files.")
     parser.add_argument("--output-dir", required=True, help="New directory for prepared shards.")
     parser.add_argument("--min-rating", type=float, default=1000)
-    parser.add_argument("--min-prior-games", type=int, default=100)
-    parser.add_argument("--trusted-players", nargs="*", default=list(TRUSTED_PLAYERS),
-                        help="These accounts bypass rating/history filters; pass no names to disable.")
+    parser.add_argument("--min-prior-games", type=int, default=0)
     parser.add_argument("--role", choices=["both", "declarer", "defender"], default="both")
     parser.add_argument("--game-kinds", nargs="+", choices=["suit", "grand"], default=["suit", "grand"])
-    parser.add_argument("--include-forced", action="store_true")
+    parser.add_argument("--include-forced", action=argparse.BooleanOptionalAction, default=True,
+                        help="Include single-legal-action states for value training (default: enabled).")
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shard-size", type=int, default=32768)

@@ -177,6 +177,8 @@ void FastSkatGame::clear_state() {
     trick_pos_ = 0;
     terminated_ = false;
     declarer_took_trick_ = false;
+    hand_game_ = false;
+    declarer_tricks_ = 0;
     won_points_.fill(0);
     for (auto& trick : history_cards_) {
         trick.fill(-1);
@@ -190,6 +192,7 @@ void FastSkatGame::clear_state() {
 
 void FastSkatGame::reset(uint64_t seed) {
     clear_state();
+    hand_game_ = true;
     seed_rng(rng_, seed);
 
     std::array<int, kNumCards> deck{};
@@ -214,6 +217,7 @@ void FastSkatGame::reset(uint64_t seed) {
 void FastSkatGame::reset_fixed_declarer(uint64_t seed, int fixed_declarer) {
     validate_player(fixed_declarer);
     clear_state();
+    hand_game_ = true;
     seed_rng(rng_, seed);
 
     while (true) {
@@ -248,7 +252,8 @@ void FastSkatGame::reset_from_deal(
     int declarer,
     int game_kind,
     int trump_suit,
-    int current_player
+    int current_player,
+    bool hand_game
 ) {
     if (hands.size() != kNumPlayers) {
         throw std::invalid_argument("hands must contain exactly three hands.");
@@ -284,6 +289,7 @@ void FastSkatGame::reset_from_deal(
     game_kind_ = game_kind;
     trump_suit_ = trump_suit;
     current_player_ = current_player;
+    hand_game_ = hand_game;
 }
 
 uint32_t FastSkatGame::legal_mask_bits() const {
@@ -472,6 +478,7 @@ StepInfo FastSkatGame::step(int action) {
         won_points_[winner] += points;
         if (winner == declarer_) {
             declarer_took_trick_ = true;
+            ++declarer_tricks_;
         }
 
         for (int i = 0; i < kTrickSize; ++i) {
@@ -509,6 +516,7 @@ StepInfo FastSkatGame::step(int action) {
     }
     if (terminated_) {
         info.declarer_won = declarer_won();
+        info.game_value = final_game_value();
     }
     return info;
 }
@@ -671,6 +679,39 @@ bool FastSkatGame::declarer_won() const {
         return !declarer_took_trick_;
     }
     return declarer_points() + card_points(skat_[0]) + card_points(skat_[1]) > 60;
+}
+
+int FastSkatGame::final_game_value() const {
+    if (game_kind_ == NULL_GAME) {
+        return hand_game_ ? 35 : 23;
+    }
+    uint32_t declarer_cards = (uint32_t{1} << skat_[0]) | (uint32_t{1} << skat_[1]);
+    for (int trick = 0; trick < kMaxTricks; ++trick) {
+        for (int slot = 0; slot < kTrickSize; ++slot) {
+            if (history_players_[trick][slot] == declarer_) {
+                declarer_cards |= uint32_t{1} << history_cards_[trick][slot];
+            }
+        }
+    }
+    std::vector<int> trumps{7, 15, 23, 31};
+    if (game_kind_ == SUIT) {
+        for (int rank : {6, 5, 4, 3, 2, 1, 0}) {
+            trumps.push_back(trump_suit_ * 8 + rank);
+        }
+    }
+    const bool with_top = (declarer_cards & (uint32_t{1} << trumps[0])) != 0;
+    int matadors = 0;
+    for (int card : trumps) {
+        if (((declarer_cards & (uint32_t{1} << card)) != 0) != with_top) {
+            break;
+        }
+        ++matadors;
+    }
+    const int points = declarer_points() + card_points(skat_[0]) + card_points(skat_[1]);
+    const bool schneider = points <= 30 || points >= 90;
+    const bool schwarz = declarer_tricks_ == 0 || declarer_tricks_ == kMaxTricks;
+    const int base = game_kind_ == GRAND ? 24 : 12 - trump_suit_;
+    return base * (matadors + 1 + int(hand_game_) + int(schneider) + int(schwarz));
 }
 
 BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer,
@@ -880,20 +921,11 @@ float BatchedFastSkatEnv::reward_for_step(const FastSkatGame& game, const StepIn
     }
 
     const int declarer = game.declarer();
-    const int declarer_points = info.declarer_points;
     const bool declarer_won = info.declarer_won.has_value() && info.declarer_won.value();
-
-    float declarer_reward = 0.0F;
-    if (declarer_won) {
-        declarer_reward = 1.0F + 0.2F * static_cast<float>(declarer_points - 60) / 60.0F;
-    } else {
-        declarer_reward = -1.0F - 0.2F * static_cast<float>(60 - declarer_points) / 60.0F;
-    }
-
     if (learning_player_ == declarer) {
-        return declarer_reward;
+        return static_cast<float>(declarer_won ? info.game_value + 50 : -2 * info.game_value - 50) / 100.0F;
     }
-    return -declarer_reward / 2.0F;
+    return declarer_won ? 0.0F : 0.4F;
 }
 
 int BatchedFastSkatEnv::choose_opponent_action(const FastSkatGame& game) const {

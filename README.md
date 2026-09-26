@@ -59,25 +59,29 @@ python -m skat_rl.training.prepare_supervised data/skatgame-games-07-2024.sgf \
   --output-dir data/prepared_skatgame
 ```
 
-The default selection includes players with a recorded rating of at least 900
-and 100 earlier appearances in the supplied data. Trusted names bypass both
-filters. To use only a numerical rating cutoff:
+The default selection includes players with a recorded rating of at least 1000.
+`--min-prior-games` optionally requires earlier appearances in the supplied data
+(default: 0). Both filters apply to every player; players without ratings are
+excluded. To use only a numerical rating cutoff:
 
 ```bash
 python -m skat_rl.training.prepare_supervised data/skatgame-games-07-2024.sgf \
-  --output-dir data/prepared_rating950 --min-rating 950 --trusted-players
+  --output-dir data/prepared_rating950 --min-rating 950 --min-prior-games 0
 ```
 
 Filtering applies to the player making each move; all players' moves are replayed.
 Both winning and losing games are retained. Defaults include ordinary suit and
 Grand games, including Hand, with all 30 card plays. Null, ouvert, announced
 Schneider/Schwarz, overbids, timeouts, disconnections, card reveals, and resignations
-are excluded in this first importer. Forced actions are omitted unless
-`--include-forced` is supplied.
+are excluded in this first importer. Forced actions are included by default so
+the critic also sees forced and late-game decisions. Use `--no-include-forced`
+to retain only states with multiple legal actions. Forced actions have zero masked
+policy loss and automatically count as correct in the current policy accuracy metric.
 
 Every accepted game is replayed through the Python engine with its recorded deal,
 pickup/discards, and contract. Turns, legal cards, final points, trick counts, and
-outcome are checked before any examples are written. Incomplete trailing SGF records
+outcome, and recorded game value (when present) are checked before any examples are
+written. Incomplete trailing SGF records
 are counted as malformed; an incomplete bzip2 stream is an error. The parser targets
 the archives' one-record-per-line ISS dialect, not arbitrary SGF variation trees.
 
@@ -86,10 +90,11 @@ and sample rejection reasons. Train/validation are split by platform and session
 duplicate record IDs and duplicate initial deals are removed across all inputs using
 an on-disk SQLite index. This prevents the same game/deal from appearing on both
 sides. Output directories must not already exist. Memory is bounded by shard size,
-although each training worker decompresses its own shard. The default 8192-row
-shard has about 38 MB of observation data before compression.
+although each training worker decompresses its own shard. The default 32768-row
+shard has about 151 MB of observation data before compression.
 
-Train the transformer using legal-action-masked cross-entropy:
+Train the policy with legal-action-masked cross-entropy and the value head with
+outcome regression:
 
 ```bash
 python -m skat_rl.training.train_supervised data/prepared_skatgame \
@@ -99,14 +104,28 @@ python -m skat_rl.training.train_supervised data/prepared_skatgame \
 The default model is the existing 4-layer, 256-dimensional transformer. Its size can
 be changed using the `--transformer-*` options. `--workers` loads shards in parallel.
 Training logs `metrics.csv`, saves `best.pt` and `last.pt`, and stops after three
-epochs without improvement in validation policy loss (`--patience`).
+epochs without improvement in combined validation loss (`--patience`).
+
+Each example stores the player's final tournament reward and the number of their
+decisions remaining after the recorded action (including omitted forced moves).
+The value target is `gamma ** remaining_decisions * terminal_reward`, matching
+PPO's discount per learner decision. Both trainers default to `--gamma 0.99`.
+Use `--gamma 1` in both for undiscounted final scores. The supervised loss is
+`policy_cross_entropy + value_coef * 0.5 * MSE(value, target)` plus optional belief
+loss; `--value-coef` defaults to `0.5`. Training logs `value_loss` for both splits.
+Outcomes are labels only, never observations. They estimate returns under the
+recorded players' play; PPO must still adapt the critic to its own policy.
+
+Prepared datasets now use format version 2. Old shards lack outcome labels:
+rerun preparation into a new directory, or use `--value-coef 0` for policy-only
+training on them. Existing datasets are not modified automatically.
 
 Belief learning is off by default. `--belief` adds supervised hidden-card prediction
 using labels stored in the shards. Hidden hands and the Skat never enter the policy
 observation. The observation encoder is shared with the Python Gym environment.
-The value head is not pretrained: game scores are not treated as PPO value targets.
-The current observation also omits the declarer's knowledge of discarded cards,
-so imitation does not capture all information the recorded player possessed.
+The current observation omits the Hand flag and the declarer's knowledge of
+discarded cards, so it does not capture all information the recorded player
+possessed. The input format is unchanged to preserve checkpoint compatibility.
 
 Initialize PPO with pretrained weights:
 
@@ -116,10 +135,34 @@ python -m skat_rl.training.train_torch_ppo \
 ```
 
 `--init-model` adopts the checkpoint's architecture and weights, while using fresh
-PPO hyperparameters and optimizer state. `--continue-model` retains its existing
-resume behavior. These options are mutually exclusive. Pretrained checkpoints also
+PPO hyperparameters and optimizer state. For checkpoints using the old reward
+scheme, it keeps the policy/encoder weights but resets the value head with a warning.
+`--continue-model` rejects old-reward checkpoints; use `--init-model` for that
+transition. Old models remain usable as frozen opponents. These options are
+mutually exclusive. Pretrained checkpoints also
 load with `PPOAgent.load()` for evaluation. They omit optimizer state and do not
 support resuming the supervised optimizer/epoch counter.
+
+## Tournament Rewards
+
+Both engines and supervised labels use three-player Seeger-Fabian tournament
+scoring, divided by 100. With unsigned game value `G`:
+
+| Outcome | Declarer reward | Each defender's reward |
+| --- | --- | --- |
+| Declarer wins | `(G + 50) / 100` | `0` |
+| Declarer loses | `(-2 * G - 50) / 100` | `0.4` |
+
+Game value includes matadors (including the Skat), Hand, Schneider, and Schwarz;
+Null and Null Hand have fixed values. Announced bonuses, ouvert, and overbids are
+not implemented. Automatically generated deals are treated as Hand games because
+the declarer never picks up or discards the Skat. Recorded games retain their
+actual Hand/non-Hand contract.
+
+Rewards are terminal-only and not zero-sum. In particular, a defender loss now
+returns zero, not a negative reward. New return curves are not directly comparable
+with old shaped-reward runs. The reward scheme is stored in dataset manifests and
+native PPO checkpoints to detect incompatible value targets.
 
 ## Self-Play
 

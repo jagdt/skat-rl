@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from skat_rl._skat_cpp import FastSkatGame
+from skat_rl.engine.scoring import tournament_rewards
 from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 
@@ -107,10 +108,9 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
             reward = 0.0
             if info["terminated"]:
                 terminal_actors.add(player)
-                reward = (1.0 if info["declarer_won"] else -1.0)
-                reward += 0.2 * (info["declarer_points"] - 60) / 60
-                if learning_player != game.declarer():
-                    reward /= -2
+                reward = tournament_rewards(
+                    game.declarer(), info["declarer_won"], info["game_value"],
+                )[learning_player]
             expected_rewards.append(reward)
         state = env.step(np.asarray(actions))
         np.testing.assert_allclose(state["rewards"], expected_rewards, atol=1e-6)

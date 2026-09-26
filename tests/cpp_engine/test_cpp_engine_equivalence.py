@@ -6,6 +6,7 @@ from skat_rl._skat_cpp import FastSkatGame
 from skat_rl.engine.cards import card_points
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.rules import points_won_by_player
+from skat_rl.engine.scoring import tournament_rewards
 from skat_rl.engine.state import GameKind, GameState, GameType, Trick
 
 
@@ -42,6 +43,7 @@ def _cpp_game_from_deal(hands, skat, declarer, game_type, current_player=0):
         _game_kind_to_int(game_type.kind),
         trump_suit,
         current_player,
+        game_type.hand,
     )
     return game
 
@@ -59,12 +61,14 @@ def _deal_from_python_seed(seed):
 
 
 @pytest.mark.parametrize("game_kind", [GameKind.SUIT, GameKind.GRAND, GameKind.NULL])
-def test_cpp_matches_python_engine_for_seeded_deals(game_kind):
+@pytest.mark.parametrize("hand_game", [False, True])
+def test_cpp_matches_python_engine_for_seeded_deals(game_kind, hand_game):
     for seed in range(100):
         rng = random.Random(seed)
         hands, skat, declarer, game_type, current_player = _deal_from_python_seed(seed)
         if game_kind != GameKind.SUIT:
             game_type = GameType(game_kind)
+        game_type.hand = hand_game
         py_game = _python_game_from_deal(hands, skat, declarer, game_type, current_player)
         cpp_game = _cpp_game_from_deal(hands, skat, declarer, game_type, current_player)
 
@@ -99,6 +103,10 @@ def test_cpp_matches_python_engine_for_seeded_deals(game_kind):
         py_result = py_result.info["result"]
         cpp_terminal = cpp_result
         assert cpp_terminal["declarer_won"] == py_result["declarer_won"]
+        assert cpp_terminal["game_value"] == py_result["game_value"]
+        assert terminal_rewards == pytest.approx(tournament_rewards(
+            declarer, py_result["declarer_won"], cpp_terminal["game_value"],
+        ))
         if game_type.kind != GameKind.NULL:
             assert cpp_terminal["declarer_points"] == py_result["declarer_points"]
             assert cpp_terminal["defender_points"] == py_result["defender_points"]
@@ -112,13 +120,6 @@ def test_cpp_matches_python_engine_for_seeded_deals(game_kind):
                 if player != declarer
             )
             assert py_result["declarer_won"] == (expected_points > 60)
-            expected_reward = (1.0 if expected_points > 60 else -1.0) + (
-                0.2 * (expected_points - 60) / 60.0
-            )
-            assert terminal_rewards[declarer] == pytest.approx(expected_reward)
-            for player in range(3):
-                if player != declarer:
-                    assert terminal_rewards[player] == pytest.approx(-expected_reward / 2.0)
         else:
             assert cpp_terminal["declarer_points"] == py_result["declarer_points"] == 0
             assert cpp_terminal["defender_points"] == py_result["defender_points"] == 0

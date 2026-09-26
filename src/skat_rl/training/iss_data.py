@@ -20,7 +20,6 @@ CARD = re.compile(r"[CSHD][789QKTAJ]\Z")
 CONTRACT = re.compile(r"([CSHDGN])([A-Z]*)(?:\.([^.]+)\.([^.]+))?\Z")
 SUITS = dict(zip("CSHD", Suit))
 RANKS = dict(zip("789QKTAJ", Rank))
-TRUSTED_PLAYERS = ("kermit", "zoot", "theCount")
 
 
 class RecordError(ValueError):
@@ -156,6 +155,7 @@ def decode_game(properties, game_kinds=("suit", "grand")):
                 raise RecordError("unsupported_contract", action)
             game_type = (GameType(GameKind.SUIT, SUITS[kind]) if kind in SUITS
                          else GameType(GameKind.GRAND if kind == "G" else GameKind.NULL))
+            game_type.hand = flags == "H"
             if game_type.kind.value not in game_kinds:
                 raise RecordError("excluded_game_kind")
             declarer = player
@@ -182,10 +182,11 @@ def decode_game(properties, game_kinds=("suit", "grand")):
     return RecordedGame(game, plays, result, outcome, deal_key)
 
 
-def replay_examples(record, eligible_players, role="both", include_forced=False):
+def replay_examples(record, eligible_players, role="both", include_forced=True):
     """Buffer at most one game's examples; reject the whole game on replay errors."""
     game = record.game
     examples = []
+    example_players = []
     for player, action in record.plays:
         if player != game.state.current_player or action not in game.legal_actions():
             raise RecordError("illegal_recorded_move", f"Player {player}, card {action}")
@@ -200,7 +201,9 @@ def replay_examples(record, eligible_players, role="both", include_forced=False)
                 "action_masks": mask,
                 "actions": action,
                 "belief_targets": encode_belief_targets(game.state, player),
+                "remaining_decisions": len(game.state.hands[player]) - 1,
             })
+            example_players.append(player)
         step = game.step(action)
     result = step.info["result"]
     if (result["declarer_points"] != int(record.result["p"])
@@ -208,4 +211,14 @@ def replay_examples(record, eligible_players, role="both", include_forced=False)
             or sum(p == game.state.declarer for p in game.state.trick_winners)
             != int(record.result["t"])):
         raise RecordError("result_mismatch")
+    if "v" in record.result:
+        try:
+            recorded_value = int(record.result["v"])
+        except ValueError as error:
+            raise RecordError("unsupported_result", "Non-integer game value.") from error
+        signed_value = result["game_value"] * (1 if result["declarer_won"] else -2)
+        if recorded_value != signed_value:
+            raise RecordError("game_value_mismatch")
+    for example, player in zip(examples, example_players):
+        example["terminal_rewards"] = step.reward[player]
     return examples

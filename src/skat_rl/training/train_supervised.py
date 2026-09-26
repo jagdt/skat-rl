@@ -1,4 +1,4 @@
-"""Pretrain the Skat transformer by imitating replayed recorded actions."""
+"""Pretrain policy and value heads from replayed moves and recorded outcomes."""
 
 import argparse
 import csv
@@ -23,7 +23,7 @@ class SupervisedBatches(IterableDataset):
         self.directory = Path(directory)
         with open(self.directory / "manifest.json", encoding="utf-8") as handle:
             manifest = json.load(handle)
-        if (manifest["format_version"] != 1 or manifest["observation_dim"] != 1149
+        if (manifest["format_version"] != 2 or manifest["observation_dim"] != 1149
                 or manifest["action_dim"] != 32):
             raise ValueError("Unsupported prepared dataset format.")
         self.files = [shard["file"] for shard in manifest["splits"][split]]
@@ -43,8 +43,8 @@ class SupervisedBatches(IterableDataset):
             rng.shuffle(files)
         for filename in files[worker_id::workers]:
             with np.load(self.directory / filename, allow_pickle=False) as shard:
-                arrays = {key: shard[key] for key in
-                          ("observations", "action_masks", "actions", "belief_targets")}
+                keys = ["observations", "action_masks", "actions", "belief_targets", "terminal_rewards", "remaining_decisions"]
+                arrays = {key: shard[key] for key in keys}
             indices = np.arange(len(arrays["actions"]))
             if self.shuffle:
                 rng.shuffle(indices)
@@ -55,7 +55,7 @@ class SupervisedBatches(IterableDataset):
 
 def run_epoch(agent, loader, training):
     agent.model.train(training)
-    totals = dict(examples=0, loss=0.0, policy_loss=0.0, correct=0,
+    totals = dict(examples=0, loss=0.0, policy_loss=0.0, value_loss=0.0, correct=0,
                   belief_loss=0.0, belief_correct=0, hidden_cards=0)
     with torch.set_grad_enabled(training):
         for batch_index, batch in enumerate(loader, 1):
@@ -64,10 +64,20 @@ def run_epoch(agent, loader, training):
             actions = batch["actions"].to(agent.device, dtype=torch.long)
             if not masks.gather(1, actions[:, None]).all():
                 raise ValueError("Dataset contains an illegal target action.")
-            logits, _, beliefs = agent.model.outputs(observations, include_belief=agent.config.use_belief)
+            logits, values, beliefs = agent.model.outputs(observations, include_belief=agent.config.use_belief)
             logits = logits.masked_fill(~masks, float("-inf"))
             policy_loss = F.cross_entropy(logits, actions)
             loss = policy_loss
+            value_loss = logits.new_zeros(())
+            if agent.config.value_coef > 0:
+                if "terminal_rewards" not in batch or "remaining_decisions" not in batch:
+                    raise ValueError("Value training requires outcome labels from prepare_supervised.")
+                terminal_rewards = batch["terminal_rewards"].to(agent.device, dtype=torch.float32)
+                remaining = batch["remaining_decisions"].to(agent.device, dtype=torch.float32)
+                # Include future forced moves, even when they were omitted from the shards.
+                targets = terminal_rewards * agent.config.gamma ** remaining
+                value_loss = 0.5 * F.mse_loss(values, targets)
+                loss = loss + agent.config.value_coef * value_loss
             belief_loss = logits.new_zeros(())
             hidden_count = 0
             if beliefs is not None:
@@ -89,18 +99,21 @@ def run_epoch(agent, loader, training):
             totals["examples"] += size
             totals["loss"] += float(loss.detach()) * size
             totals["policy_loss"] += float(policy_loss.detach()) * size
+            totals["value_loss"] += float(value_loss.detach()) * size
             totals["correct"] += int((logits.argmax(-1) == actions).sum())
             totals["belief_loss"] += float(belief_loss.detach()) * hidden_count
             totals["hidden_cards"] += hidden_count
             if training and batch_index % 100 == 0:
                 print(f"batches={batch_index} examples={totals['examples']} "
-                      f"policy_loss={totals['policy_loss'] / totals['examples']:.4f}", flush=True)
+                      f"policy_loss={totals['policy_loss'] / totals['examples']:.4f} "
+                      f"value_loss={totals['value_loss'] / totals['examples']:.4f}", flush=True)
     if not totals["examples"]:
         raise ValueError("Dataset yielded no examples.")
     return {
         "examples": totals["examples"],
         "loss": totals["loss"] / totals["examples"],
         "policy_loss": totals["policy_loss"] / totals["examples"],
+        "value_loss": totals["value_loss"] / totals["examples"],
         "accuracy": totals["correct"] / totals["examples"],
         "belief_loss": totals["belief_loss"] / max(totals["hidden_cards"], 1),
         "belief_accuracy": totals["belief_correct"] / max(totals["hidden_cards"], 1),
@@ -108,9 +121,9 @@ def run_epoch(agent, loader, training):
 
 
 def save_pretrained(agent, path, epoch):
-    # PPO should start a fresh optimizer; the critic has not been supervised here.
+    # PPO starts with a fresh optimizer, even when both heads are pretrained.
     torch.save({"config": asdict(agent.config), "model_state_dict": agent.model.state_dict(),
-                "supervised_epoch": epoch, "critic_pretrained": False}, path)
+                "supervised_epoch": epoch, "critic_pretrained": agent.config.value_coef > 0}, path)
 
 
 def train(args):
@@ -118,6 +131,10 @@ def train(args):
         raise ValueError("Epochs, batch-size, patience and torch-threads must be positive; workers >= 0.")
     if not np.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("learning-rate must be finite and positive.")
+    if not np.isfinite(args.value_coef) or args.value_coef < 0:
+        raise ValueError("value-coef must be finite and nonnegative.")
+    if not np.isfinite(args.gamma) or not 0 <= args.gamma <= 1:
+        raise ValueError("gamma must be between 0 and 1.")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -128,6 +145,7 @@ def train(args):
         transformer_heads=args.transformer_heads, transformer_ff_dim=args.transformer_ff_dim,
         transformer_dropout=args.transformer_dropout, learning_rate=args.learning_rate,
         use_belief=args.belief, belief_coef=args.belief_coef,
+        value_coef=args.value_coef, gamma=args.gamma,
     )
     agent = PPOAgent(config, device=args.device)
     datasets = {split: SupervisedBatches(args.dataset, split, args.batch_size,
@@ -156,15 +174,17 @@ def train(args):
             writer.writerow(row)
             handle.flush()
             save_pretrained(agent, output / "last.pt", epoch)
-            if validation_metrics["policy_loss"] < best_loss:
-                best_loss = validation_metrics["policy_loss"]
+            if validation_metrics["loss"] < best_loss:
+                best_loss = validation_metrics["loss"]
                 stale_epochs = 0
                 save_pretrained(agent, output / "best.pt", epoch)
             else:
                 stale_epochs += 1
-            print(f"epoch={epoch} train_loss={train_metrics['policy_loss']:.4f} "
-                  f"validation_loss={validation_metrics['policy_loss']:.4f} "
-                  f"validation_accuracy={validation_metrics['accuracy']:.3f}", flush=True)
+            print(f"epoch={epoch} train_loss={train_metrics['loss']:.4f} "
+                  f"validation_loss={validation_metrics['loss']:.4f} "
+                  f"validation_policy_loss={validation_metrics['policy_loss']:.4f} "
+                  f"validation_accuracy={validation_metrics['accuracy']:.3f} "
+                  f"validation_value_loss={validation_metrics['value_loss']:.4f}", flush=True)
             if stale_epochs >= args.patience:
                 print("Stopping after validation loss stopped improving.", flush=True)
                 break
@@ -191,6 +211,10 @@ def _parse_args():
     parser.add_argument("--transformer-dropout", type=float, default=0.0)
     parser.add_argument("--belief", action="store_true")
     parser.add_argument("--belief-coef", type=float, default=0.05)
+    parser.add_argument("--value-coef", type=float, default=0.5,
+                        help="Weight for outcome regression; 0 disables value pretraining.")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount per player decision, matching PPO.")
     return parser.parse_args()
 
 

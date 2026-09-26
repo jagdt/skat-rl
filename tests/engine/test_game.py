@@ -93,20 +93,22 @@ def test_terminal_reward_marks_declarer_win_and_loss():
             "declarer": 1,
             "declarer_won": True,
             "declarer_points": 60,
+            "game_value": 24,
         }
     ) == [
-        pytest.approx(-0.5),
-        pytest.approx(1.0),
-        pytest.approx(-0.5),
+        pytest.approx(0.0),
+        pytest.approx(0.74),
+        pytest.approx(0.0),
     ]
     assert game._terminal_reward(
         {
             "declarer": 1,
             "declarer_won": False,
             "declarer_points": 60,
+            "game_value": 24,
         }
     ) == [
-        pytest.approx(0.5),
-        pytest.approx(-1.0),
-        pytest.approx(0.5),
+        pytest.approx(0.4),
+        pytest.approx(-0.98),
+        pytest.approx(0.4),
     ]

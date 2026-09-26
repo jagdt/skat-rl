@@ -52,6 +52,7 @@ struct StepInfo {
     int declarer_points = 0;
     int defender_points = 0;
     std::optional<bool> declarer_won;
+    int game_value = 0;
 };
 
 class FastSkatGame {
@@ -66,7 +67,8 @@ public:
         int declarer,
         int game_kind,
         int trump_suit,
-        int current_player
+        int current_player,
+        bool hand_game = false
     );
 
     std::vector<int> legal_actions() const;
@@ -104,6 +106,8 @@ private:
     int trick_pos_ = 0;
     bool terminated_ = false;
     bool declarer_took_trick_ = false;
+    bool hand_game_ = false;
+    int declarer_tricks_ = 0;
     std::array<int, kNumPlayers> won_points_{};
     std::array<std::array<int, kTrickSize>, kMaxTricks> history_cards_{};
     std::array<std::array<int, kTrickSize>, kMaxTricks> history_players_{};
@@ -116,6 +120,7 @@ private:
     int current_trick_winner() const;
     int current_trick_points() const;
     bool declarer_won() const;
+    int final_game_value() const;
 };
 
 struct BatchedStepInfo {
