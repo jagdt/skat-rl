@@ -2,6 +2,7 @@ import numpy as np
 from gymnasium import spaces
 
 from skat_rl._skat_cpp import BatchedFastSkatEnv
+from skat_rl.envs.observations import observation_space
 
 
 class SkatCppBatchedSingleAgentEnv:
@@ -36,12 +37,7 @@ class SkatCppBatchedSingleAgentEnv:
             self.fixed_declarer,
             self.autoplay_opponents,
         )
-        self.observation_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(self.game.observation_dim(),),
-            dtype=np.float32,
-        )
+        self.observation_space = observation_space()
         self.action_space = spaces.Discrete(self.game.action_dim())
 
     def reset(self, seed=None):
@@ -82,7 +78,7 @@ class SkatCppBatchedSingleAgentEnv:
             "active_indices": np.asarray(self.game.active_indices(), dtype=np.int64),
             "current_players": np.asarray(self.game.current_players(), dtype=np.int64),
             "declarers": np.asarray(self.game.declarers(), dtype=np.int64),
-            "observations": np.asarray(self.game.observations(), dtype=np.float32),
+            "observations": self.game.observations(),
             "action_masks": np.asarray(self.game.action_masks(), dtype=bool),
             "belief_targets": np.asarray(self.game.belief_targets(), dtype=np.int64),
         }
@@ -98,7 +94,7 @@ class SkatCppBatchedSingleAgentEnv:
             "active_indices": np.asarray(result["active_indices"], dtype=np.int64),
             "current_players": np.asarray(result["current_players"], dtype=np.int64),
             "declarers": np.asarray(result["declarers"], dtype=np.int64),
-            "observations": np.asarray(result["observations"], dtype=np.float32),
+            "observations": result["observations"],
             "action_masks": np.asarray(result["action_masks"], dtype=bool),
             "belief_targets": np.asarray(result["belief_targets"], dtype=np.int64),
         }

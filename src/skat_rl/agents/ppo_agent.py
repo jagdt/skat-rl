@@ -9,11 +9,17 @@ from torch import nn
 from torch.distributions import Categorical
 from torch.nn import functional as F
 
+from skat_rl.engine.cards import Rank, Suit
+from skat_rl.envs.observations import (
+    OBSERVATION_SPECS, NUM_CARDS, NUM_TRICKS,
+    CardStatus, Contract, Phase, RelativePlayer, TrickSlot,
+    StructuredSkatObservation, effective_suit_table, empty_observations, index_observations,
+)
+
 
 @dataclass
 class PPOConfig:
-    observation_dim: int
-    action_dim: int
+    action_dim: int = NUM_CARDS
     architecture: str = "mlp"
     use_belief: bool = False
     hidden_sizes: tuple[int, ...] = (256, 256)
@@ -43,22 +49,23 @@ class MaskedActorCritic(nn.Module):
         activation = _activation(config.activation)
 
         self.policy_net = _mlp(
-            config.observation_dim,
+            sum(int(np.prod(spec[0])) for spec in OBSERVATION_SPECS.values()),
             config.hidden_sizes,
             config.action_dim,
             activation,
         )
         self.value_net = _mlp(
-            config.observation_dim,
+            sum(int(np.prod(spec[0])) for spec in OBSERVATION_SPECS.values()),
             config.hidden_sizes,
             1,
             activation,
         )
 
     def forward(self, observations, action_masks=None, actions=None):
-        logits = self.policy_net(observations)
+        features = _mlp_features(observations)
+        logits = self.policy_net(features)
         distribution = masked_categorical(logits, action_masks)
-        values = self.value_net(observations).squeeze(-1)
+        values = self.value_net(features).squeeze(-1)
 
         if actions is None:
             actions = distribution.sample()
@@ -72,229 +79,79 @@ class MaskedActorCritic(nn.Module):
         )
 
     def value(self, observations):
-        return self.value_net(observations).squeeze(-1)
+        return self.value_net(_mlp_features(observations)).squeeze(-1)
 
     def policy_logits(self, observations):
-        return self.policy_net(observations)
+        return self.policy_net(_mlp_features(observations))
 
 
 class SkatObservationTokenizer(nn.Module):
-    """Builds one STATE token plus one persistent token for each of the 32 cards.
+    """Embed explicit public fields into one STATE and 32 persistent CARD tokens."""
 
-    Card tokens are deliberately card-centric and fixed in number. They contain only
-    information observable by the acting player:
-
-      card = rank + printed suit + effective suit + status
-             + (played-by + trick + slot, only when already played)
-
-    The STATE token contains the contract, relative declarer, relative current
-    trick leader, and a joint linear projection of numeric score/progress values.
-
-    The tokenizer intentionally does *not* use the old current-player, current-trick,
-    void-info, or explicit defender/declarer-role features as model inputs. The
-    current player is used only to canonicalize absolute player IDs into a relative
-    SELF/NEXT/PREVIOUS frame.
-
-    This assumes history_cards/history_players contain every card already played,
-    including cards in the current trick, in chronological play order.
-    """
-
-    observation_dim = 1149
-    num_cards = 32
-    num_players = 3
-    history_slots = 30
-    num_tricks = 10
-    num_ranks = 8
-    num_suits = 4
-
-    # Contract IDs used internally by the tokenizer.
-    clubs_contract = 0
-    spades_contract = 1
-    hearts_contract = 2
-    diamonds_contract = 3
-    grand_contract = 4
-    null_contract = 5
-    num_contracts = 6
-
-    # Effective card categories: four printed suits plus TRUMP.
-    trump_category = 4
-    num_effective_categories = 5
-
-    # Card status IDs.
-    unknown_status = 0
-    own_status = 1
-    played_status = 2
-    num_card_statuses = 3
-
-    # Matches the Rank enum used by the engine: JACK = 7.
-    jack_rank = 7
+    num_cards = NUM_CARDS
 
     def __init__(self, model_dim):
         super().__init__()
-
-        # Card semantics. There is intentionally no separate 32-card-ID embedding:
-        # rank + suit uniquely identify a physical Skat card.
-        self.rank_embedding = nn.Embedding(self.num_ranks, model_dim)
-        self.suit_embedding = nn.Embedding(self.num_suits, model_dim)
-        self.effective_suit_embedding = nn.Embedding(
-            self.num_effective_categories,
-            model_dim,
-        )
-        self.card_status_embedding = nn.Embedding(self.num_card_statuses, model_dim)
-
-        # Played-card metadata. No NONE categories are required; these embeddings
-        # are simply added only for cards whose status is PLAYED.
-        self.player_embedding = nn.Embedding(self.num_players, model_dim)
-        self.trick_projection = nn.Linear(1, model_dim, bias=False)
-        self.slot_embedding = nn.Embedding(3, model_dim)
-
-        # Global state semantics.
+        self.rank_embedding = nn.Embedding(len(Rank), model_dim)
+        self.suit_embedding = nn.Embedding(len(Suit), model_dim)
+        self.effective_suit_embedding = nn.Embedding(len(Suit) + 1, model_dim)
+        self.card_status_embedding = nn.Embedding(len(CardStatus), model_dim)
+        self.player_embedding = nn.Embedding(len(RelativePlayer), model_dim)
+        self.trick_index_projection = nn.Linear(1, model_dim, bias=False)
+        self.slot_embedding = nn.Embedding(len(TrickSlot), model_dim)
         self.state_token = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.contract_embedding = nn.Embedding(self.num_contracts, model_dim)
-
-        # Declarer/leader use the same underlying relative-player identity space,
-        # with small role-specific projections so their meaning in STATE is distinct.
+        self.phase_embedding = nn.Embedding(len(Phase), model_dim)
+        self.contract_embedding = nn.Embedding(len(Contract), model_dim)
         self.declarer_projection = nn.Linear(model_dim, model_dim, bias=False)
         self.leader_projection = nn.Linear(model_dim, model_dim, bias=False)
-
-        # [declarer points, defender points, trick progress] -> model space.
         self.numeric_state_projection = nn.Linear(3, model_dim, bias=False)
-
         self.output_norm = nn.LayerNorm(model_dim)
+        card_ids = torch.arange(NUM_CARDS)
+        self.register_buffer("card_ranks", card_ids % len(Rank), persistent=False)
+        self.register_buffer("card_suits", card_ids // len(Rank), persistent=False)
+        self.register_buffer("effective_suits", torch.as_tensor(effective_suit_table()), persistent=False)
 
-        card_ids = torch.arange(self.num_cards)
-        self.register_buffer("card_ranks", card_ids % self.num_ranks, persistent=False)
-        self.register_buffer("card_suits", card_ids // self.num_ranks, persistent=False)
+    def tokenize_cards(self, observation):
+        status = observation["card_status"]
+        played = status == CardStatus.PLAYED
+        card_tokens = (
+            self.rank_embedding(self.card_ranks)
+            + self.suit_embedding(self.card_suits)
+            + self.effective_suit_embedding(self.effective_suits[observation["contract"]])
+            + self.card_status_embedding(status)
+        )
+        # Sentinels never enter an embedding or contribute to an unplayed token.
+        played_by = torch.where(played, observation["played_by"], 0)
+        trick_indices = torch.where(played, observation["trick_index"], 0).float() / (NUM_TRICKS - 1)
+        slots = torch.where(played, observation["trick_slot"], 0)
+        metadata = (
+            self.player_embedding(played_by)
+            + self.trick_index_projection(trick_indices.unsqueeze(-1))
+            + self.slot_embedding(slots)
+        )
+        return card_tokens + metadata * played.unsqueeze(-1)
+
+    def tokenize_state(self, observation):
+        numeric = torch.stack([
+            observation["declarer_points"].float() / 120.0,
+            observation["defender_points"].float() / 120.0,
+            observation["current_trick"].float() / (NUM_TRICKS - 1),
+        ], dim=-1)
+        return (
+            self.state_token[:, 0]
+            + self.phase_embedding(observation["phase"])
+            + self.contract_embedding(observation["contract"])
+            + self.declarer_projection(self.player_embedding(observation["relative_declarer"]))
+            + self.leader_projection(self.player_embedding(observation["relative_current_leader"]))
+            + self.numeric_state_projection(numeric)
+        )
 
     def forward(self, observations):
-        if observations.shape[-1] != self.observation_dim:
-            raise ValueError(
-                f"Skat transformer expects observation_dim={self.observation_dim}, "
-                f"got {observations.shape[-1]}."
-            )
-
-        batch_size = observations.shape[0]
-
-        # Existing flat observation layout.
-        own_hand = observations[:, 0:32]
-        history_cards = observations[:, 32:992].reshape(batch_size, 30, 32)
-        history_players = observations[:, 992:1082].reshape(batch_size, 30, 3)
-        current_player = observations[:, 1114:1117]
-        current_leader = observations[:, 1117:1120]
-        declarer = observations[:, 1120:1123]
-        global_features = observations[:, 1123:1134]
-
-        # global_features layout used by the current environment:
-        #   0:3   game kind one-hot [SUIT, GRAND, NULL]
-        #   3:7   trump-suit one-hot [CLUBS, SPADES, HEARTS, DIAMONDS]
-        #   7     normalized trick number
-        #   8     normalized current-trick position (intentionally unused)
-        #   9     normalized declarer points
-        #   10    normalized defender points
-        game_kind = global_features[:, 0:3].argmax(dim=-1)
-        trump_suit = global_features[:, 3:7].argmax(dim=-1)
-        contract = torch.where(
-            game_kind == 0,
-            trump_suit,
-            torch.where(
-                game_kind == 1,
-                torch.full_like(game_kind, self.grand_contract),
-                torch.full_like(game_kind, self.null_contract),
-            ),
-        )
-
-        # Canonicalize all player identities relative to the acting player.
-        # 0 = SELF, 1 = next seat in engine order, 2 = previous seat.
-        current_player_id = current_player.argmax(dim=-1)
-        declarer_id = declarer.argmax(dim=-1)
-        leader_id = current_leader.argmax(dim=-1)
-        relative_declarer = (declarer_id - current_player_id) % self.num_players
-        relative_leader = (leader_id - current_player_id) % self.num_players
-
-        # Reconstruct played-card metadata from the ordered 30-slot history.
-        played = history_cards.amax(dim=1) > 0.5
-        history_position = history_cards.argmax(dim=1)
-        played_trick = history_position // self.num_players
-        played_slot = history_position % self.num_players
-        played_trick_progress = (
-            played_trick.to(observations.dtype) / (self.num_tricks - 1)
-        ).unsqueeze(-1)
-
-        played_by_scores = torch.einsum("bsc,bsp->bcp", history_cards, history_players)
-        played_by_id = played_by_scores.argmax(dim=-1)
-        relative_played_by = (
-            played_by_id - current_player_id.unsqueeze(1)
-        ) % self.num_players
-
-        own = own_hand > 0.5
-        card_status = torch.full_like(history_position, self.unknown_status)
-        card_status = torch.where(
-            own,
-            torch.full_like(card_status, self.own_status),
-            card_status,
-        )
-        card_status = torch.where(
-            played,
-            torch.full_like(card_status, self.played_status),
-            card_status,
-        )
-
-        # Determine effective suit/trump category for every card under this contract.
-        ranks = self.card_ranks.unsqueeze(0).expand(batch_size, -1)
-        suits = self.card_suits.unsqueeze(0).expand(batch_size, -1)
-        contract_per_card = contract.unsqueeze(1)
-
-        jack_is_trump = (ranks == self.jack_rank) & (
-            contract_per_card != self.null_contract
-        )
-        suit_card_is_trump = (
-            (contract_per_card < self.grand_contract)
-            & (suits == contract_per_card)
-        )
-        is_trump = jack_is_trump | suit_card_is_trump
-        effective_suit = torch.where(
-            is_trump,
-            torch.full_like(suits, self.trump_category),
-            suits,
-        )
-
-        # Every game state always has exactly 32 card tokens.
-        card_tokens = (
-            self.rank_embedding(ranks)
-            + self.suit_embedding(suits)
-            + self.effective_suit_embedding(effective_suit)
-            + self.card_status_embedding(card_status)
-        )
-
-        # Played metadata is conditional: unplayed cards receive exactly zero here,
-        # so no artificial NONE embeddings are needed.
-        played_metadata = (
-            self.player_embedding(relative_played_by)
-            + self.trick_projection(played_trick_progress)
-            + self.slot_embedding(played_slot)
-        )
-        card_tokens = card_tokens + played_metadata * played.unsqueeze(-1)
-
-        numeric_state = torch.stack(
-            [
-                global_features[:, 9],
-                global_features[:, 10],
-                global_features[:, 7],
-            ],
-            dim=-1,
-        )
-
-        state_token = self.state_token.expand(batch_size, -1, -1).squeeze(1)
-        state_token = (
-            state_token
-            + self.contract_embedding(contract)
-            + self.declarer_projection(self.player_embedding(relative_declarer))
-            + self.leader_projection(self.player_embedding(relative_leader))
-            + self.numeric_state_projection(numeric_state)
-        )
-
-        tokens = torch.cat([state_token.unsqueeze(1), card_tokens], dim=1)
-        return self.output_norm(tokens)
+        # void_info is retained in the public schema. As in the previous model,
+        # the transformer can infer it from the complete per-card play history.
+        state = self.tokenize_state(observations)
+        cards = self.tokenize_cards(observations)
+        return self.output_norm(torch.cat([state.unsqueeze(1), cards], dim=1))
 
 
 class SkatTransformerActorCritic(nn.Module):
@@ -309,8 +166,6 @@ class SkatTransformerActorCritic(nn.Module):
 
     def __init__(self, config: PPOConfig):
         super().__init__()
-        if config.observation_dim != SkatObservationTokenizer.observation_dim:
-            raise ValueError("The Skat transformer requires the 1,149-value Skat observation.")
         if config.action_dim != SkatObservationTokenizer.num_cards:
             raise ValueError("The Skat transformer requires one action per card (32 actions).")
         if config.transformer_heads < 1:
@@ -414,7 +269,8 @@ class PPOAgent:
 
     @torch.no_grad()
     def act(self, observation, action_mask=None, deterministic=False):
-        observations = _to_tensor(observation, self.device).float().unsqueeze(0)
+        observations = {key: value.unsqueeze(0) for key, value in
+                        observation_to_tensors(observation, self.device).items()}
         masks = None
         if action_mask is not None:
             masks = _to_tensor(action_mask, self.device).bool().unsqueeze(0)
@@ -430,7 +286,7 @@ class PPOAgent:
 
     @torch.no_grad()
     def get_action_and_value(self, observations, action_masks):
-        observations = _to_tensor(observations, self.device).float()
+        observations = observation_to_tensors(observations, self.device)
         action_masks = _to_tensor(action_masks, self.device).bool()
         if isinstance(self.model, SkatTransformerActorCritic):
             results = self.model(observations, action_masks, include_belief=False)
@@ -445,19 +301,19 @@ class PPOAgent:
 
     @torch.no_grad()
     def get_values(self, observations):
-        observations = _to_tensor(observations, self.device).float()
+        observations = observation_to_tensors(observations, self.device)
         return self.model.value(observations).cpu().numpy()
 
     @torch.no_grad()
     def get_belief_probabilities(self, observations):
         if not isinstance(self.model, SkatTransformerActorCritic) or not self.model.use_belief:
             raise RuntimeError("Belief predictions require a belief-enabled transformer.")
-        observations = _to_tensor(observations, self.device).float()
+        observations = observation_to_tensors(observations, self.device)
         _, _, belief_logits = self.model.outputs(observations)
         return belief_logits.softmax(dim=-1).cpu().numpy()
 
     def update(self, rollout):
-        observations = _to_tensor(rollout.observations, self.device).float()
+        observations = observation_to_tensors(rollout.observations, self.device)
         actions = _to_tensor(rollout.actions, self.device).long()
         old_log_probs = _to_tensor(rollout.log_probs, self.device).float()
         advantages = _to_tensor(rollout.advantages, self.device).float()
@@ -471,7 +327,7 @@ class PPOAgent:
         if self.config.normalize_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
-        batch_size = observations.shape[0]
+        batch_size = observations["contract"].shape[0]
         minibatch_size = min(self.config.minibatch_size, batch_size)
         metrics = []
 
@@ -482,7 +338,7 @@ class PPOAgent:
                 minibatch = indices[start:start + minibatch_size]
 
                 _, new_log_probs, entropy, new_values, belief_logits = self.model(
-                    observations[minibatch],
+                    index_observations(observations, minibatch),
                     action_masks[minibatch],
                     actions[minibatch],
                 )
@@ -579,12 +435,7 @@ class PPOAgent:
     @classmethod
     def load(cls, path, device: str | torch.device | None = None):
         checkpoint = torch.load(path, map_location=device or "cpu")
-        config_values = dict(checkpoint["config"])
-        config_values.pop("belief_decoder_layers", None)
-        config_values.pop("belief_detach_updates", None)
-        if "use_belief" not in config_values:
-            config_values["use_belief"] = config_values.get("architecture") == "transformer"
-        config = PPOConfig(**config_values)
+        config = PPOConfig(**checkpoint["config"])
         agent = cls(config, device=device)
         try:
             agent.model.load_state_dict(checkpoint["model_state_dict"])
@@ -600,7 +451,7 @@ class PPOAgent:
 
 @dataclass
 class RolloutBatch:
-    observations: np.ndarray
+    observations: StructuredSkatObservation
     actions: np.ndarray
     log_probs: np.ndarray
     rewards: np.ndarray
@@ -613,9 +464,9 @@ class RolloutBatch:
 
 
 class RolloutBuffer:
-    def __init__(self, rollout_steps, n_envs, observation_dim, action_dim, use_belief=False):
+    def __init__(self, rollout_steps, n_envs, action_dim, use_belief=False):
         shape = (rollout_steps, n_envs)
-        self.observations = np.zeros(shape + (observation_dim,), dtype=np.float32)
+        self.observations = empty_observations(shape)
         self.actions = np.zeros(shape, dtype=np.int64)
         self.log_probs = np.zeros(shape, dtype=np.float32)
         self.rewards = np.zeros(shape, dtype=np.float32)
@@ -640,7 +491,8 @@ class RolloutBuffer:
         action_masks,
         belief_targets=None,
     ):
-        self.observations[step] = observations
+        for key in OBSERVATION_SPECS:
+            self.observations[key][step] = observations[key]
         self.actions[step] = actions
         self.log_probs[step] = log_probs
         self.rewards[step] = rewards
@@ -675,7 +527,8 @@ class RolloutBuffer:
         rollout_steps, n_envs = self.actions.shape
         batch_size = rollout_steps * n_envs
         return RolloutBatch(
-            observations=self.observations.reshape(batch_size, -1),
+            observations={key: value.reshape((batch_size,) + OBSERVATION_SPECS[key][0])
+                          for key, value in self.observations.items()},
             actions=self.actions.reshape(batch_size),
             log_probs=self.log_probs.reshape(batch_size),
             rewards=self.rewards.reshape(batch_size),
@@ -740,6 +593,27 @@ def _activation(name):
         return activations[name.lower()]
     except KeyError as error:
         raise ValueError(f"Unsupported activation: {name}") from error
+
+
+def observation_to_tensors(observations, device):
+    """Transfer named fields together, preserving integer categorical semantics."""
+    if not isinstance(observations, dict) or observations.keys() != OBSERVATION_SPECS.keys():
+        raise ValueError("Expected structured policy observation fields only.")
+    return {
+        key: (value.to(device=device, dtype=torch.long, non_blocking=True)
+              if isinstance(value, torch.Tensor)
+              else torch.as_tensor(value, dtype=torch.long, device=device))
+        for key, value in observations.items()
+    }
+
+
+def _mlp_features(observations):
+    """Explicit feature adapter for the optional MLP, never used by the tokenizer."""
+    batch_size = observations["contract"].shape[0]
+    return torch.cat([
+        observations[key].float().reshape(batch_size, int(np.prod(shape))) / max(high, 1)
+        for key, (shape, _, high) in OBSERVATION_SPECS.items()
+    ], dim=-1)
 
 
 def _to_tensor(value, device):

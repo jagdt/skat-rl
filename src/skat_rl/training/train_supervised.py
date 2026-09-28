@@ -12,7 +12,8 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig
+from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, observation_to_tensors
+from skat_rl.envs.observations import DATASET_FORMAT_VERSION, OBSERVATION_SPECS
 
 
 class SupervisedBatches(IterableDataset):
@@ -23,9 +24,9 @@ class SupervisedBatches(IterableDataset):
         self.directory = Path(directory)
         with open(self.directory / "manifest.json", encoding="utf-8") as handle:
             manifest = json.load(handle)
-        if (manifest["format_version"] != 2 or manifest["observation_dim"] != 1149
+        if (manifest["format_version"] != DATASET_FORMAT_VERSION
                 or manifest["action_dim"] != 32):
-            raise ValueError("Unsupported prepared dataset format.")
+            raise ValueError("Unsupported prepared dataset format. Regenerate with prepare_supervised.")
         self.files = [shard["file"] for shard in manifest["splits"][split]]
         if not self.files:
             raise ValueError(f"No {split} shards in dataset.")
@@ -43,14 +44,19 @@ class SupervisedBatches(IterableDataset):
             rng.shuffle(files)
         for filename in files[worker_id::workers]:
             with np.load(self.directory / filename, allow_pickle=False) as shard:
-                keys = ["observations", "action_masks", "actions", "belief_targets", "terminal_rewards", "remaining_decisions"]
+                keys = ["action_masks", "actions", "belief_targets", "terminal_rewards", "remaining_decisions"]
                 arrays = {key: shard[key] for key in keys}
+                observations = {name: shard[f"obs_{name}"] for name in OBSERVATION_SPECS}
             indices = np.arange(len(arrays["actions"]))
             if self.shuffle:
                 rng.shuffle(indices)
             for start in range(0, len(indices), self.batch_size):
                 batch_indices = indices[start:start + self.batch_size]
-                yield {key: torch.from_numpy(value[batch_indices]) for key, value in arrays.items()}
+                batch = {key: torch.from_numpy(value[batch_indices]) for key, value in arrays.items()}
+                batch["observations"] = {
+                    name: torch.from_numpy(value[batch_indices]) for name, value in observations.items()
+                }
+                yield batch
 
 
 def run_epoch(agent, loader, training):
@@ -59,7 +65,7 @@ def run_epoch(agent, loader, training):
                   belief_loss=0.0, belief_correct=0, hidden_cards=0)
     with torch.set_grad_enabled(training):
         for batch_index, batch in enumerate(loader, 1):
-            observations = batch["observations"].to(agent.device, dtype=torch.float32)
+            observations = observation_to_tensors(batch["observations"], agent.device)
             masks = batch["action_masks"].to(agent.device, dtype=torch.bool)
             actions = batch["actions"].to(agent.device, dtype=torch.long)
             if not masks.gather(1, actions[:, None]).all():
@@ -140,7 +146,7 @@ def train(args):
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.torch_threads)
     config = PPOConfig(
-        observation_dim=1149, action_dim=32, architecture="transformer",
+        action_dim=32, architecture="transformer",
         transformer_dim=args.transformer_dim, transformer_layers=args.transformer_layers,
         transformer_heads=args.transformer_heads, transformer_ff_dim=args.transformer_ff_dim,
         transformer_dropout=args.transformer_dropout, learning_rate=args.learning_rate,

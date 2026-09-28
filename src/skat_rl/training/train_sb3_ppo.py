@@ -40,7 +40,7 @@ def main():
         "seed": 42,
     }
     model_config = {
-        "policy": "MlpPolicy",
+        "policy": "MultiInputPolicy",
         "policy_kwargs":dict(net_arch=dict(pi=[512, 512, 512, 512, 512, 512, 512, 512],vf=[512, 512, 512, 512, 512, 512, 512, 512])),
         "verbose": 1,
         "learning_rate": 3e-4,

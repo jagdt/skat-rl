@@ -3,6 +3,7 @@ import pytest
 
 from skat_rl._skat_cpp import FastSkatGame
 from skat_rl.engine.scoring import tournament_rewards
+from skat_rl.envs.observations import CardStatus, OBSERVATION_SPECS, index_observations
 from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 
@@ -17,8 +18,10 @@ def test_cpp_batched_env_reset_shapes_and_masks():
     state = env.reset(seed=1)
 
     assert state["active_indices"].tolist() == [0, 1, 2, 3]
-    assert state["observations"].shape == (4, 1149)
-    assert state["observations"].dtype == np.float32
+    for name, (shape, _, _) in OBSERVATION_SPECS.items():
+        assert state["observations"][name].shape == (4,) + shape
+        assert state["observations"][name].dtype == np.int8
+    assert env.observation_space.contains(index_observations(state["observations"], 0))
     assert state["action_masks"].shape == (4, 32)
     assert state["action_masks"].dtype == bool
     assert state["action_masks"].any(axis=1).all()
@@ -97,11 +100,11 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
             player = game.current_player()
             assert state["current_players"][row] == player
             assert state["declarers"][row] == game.declarer()
-            np.testing.assert_allclose(state["observations"][row], game.observation(player))
+            assert_observations_equal(index_observations(state["observations"], row), game.observation(player))
             np.testing.assert_array_equal(state["action_masks"][row], game.legal_mask_array())
             np.testing.assert_array_equal(state["belief_targets"][row], game.belief_targets(player))
-            # The hand plane must never contain the other seats' private cards.
-            assert set(np.flatnonzero(state["observations"][row, :32])) == set(game.hand(player))
+            # The OWN status must never contain the other seats' private cards.
+            assert set(np.flatnonzero(state["observations"]["card_status"][row] == CardStatus.OWN)) == set(game.hand(player))
             action = game.legal_actions()[0]
             actions.append(action)
             info = game.step(action)
@@ -125,7 +128,8 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
     assert state["completed_lengths"].tolist() == [10] * 12
     np.testing.assert_allclose(state["completed_returns"], expected_rewards, atol=1e-6)
     assert env.active_count() == 0
-    assert state["observations"].shape == (0, 1149)
+    for name, (shape, _, _) in OBSERVATION_SPECS.items():
+        assert state["observations"][name].shape == (0,) + shape
     assert state["action_masks"].shape == (0, 32)
     assert state["belief_targets"].shape == (0, 32)
     assert state["current_players"].shape == (0,)
@@ -133,7 +137,7 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
     assert env.step([])["env_indices"].shape == (0,)
     reset = env.reset(seed=17)
     assert reset["current_players"].tolist() == [0] * 12
-    np.testing.assert_allclose(reset["observations"], env.reset(seed=17)["observations"])
+    assert_observations_equal(reset["observations"], env.reset(seed=17)["observations"])
 
 
 @pytest.mark.parametrize("autoplay", [True, False])
@@ -144,14 +148,20 @@ def test_invalid_batch_does_not_partially_step_games(autoplay):
     actions[-1] = np.flatnonzero(~state["action_masks"][-1])[0]
     with pytest.raises(ValueError, match="illegal action"):
         env.step(actions)
-    np.testing.assert_array_equal(env._state()["observations"], state["observations"])
+    assert_observations_equal(env._state()["observations"], state["observations"])
     for invalid in ([0], [[0, 1, 2]], [0.5, 1.5, 2.5], [-1, 0, 0], [32, 0, 0]):
         with pytest.raises(ValueError):
             env.step(invalid)
-        np.testing.assert_array_equal(env._state()["observations"], state["observations"])
+        assert_observations_equal(env._state()["observations"], state["observations"])
 
 
 @pytest.mark.parametrize("size", [0, -1])
 def test_batch_size_must_be_positive(size):
     with pytest.raises(ValueError, match="at least 1"):
         SkatCppBatchedSingleAgentEnv(size)
+
+
+def assert_observations_equal(actual, expected):
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)

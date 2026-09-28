@@ -9,6 +9,9 @@ import sqlite3
 
 import numpy as np
 
+from skat_rl.envs.observations import (
+    DATASET_FORMAT_VERSION, OBSERVATION_SPECS, stack_observations,
+)
 from skat_rl.training.iss_data import (
     RecordError, base_player_name, decode_game, open_records,
     parse_record, player_rating, replay_examples,
@@ -33,11 +36,13 @@ class ShardWriter:
         if not self.rows:
             return
         filename = f"{self.split}-{len(self.shards):05d}.npz"
-        dtypes = {"observations": np.float32, "action_masks": bool, "actions": np.uint8,
+        dtypes = {"action_masks": bool, "actions": np.uint8,
                   "belief_targets": np.int8, "game_ids": str,
                   "terminal_rewards": np.float32, "remaining_decisions": np.uint8}
         arrays = {key: np.asarray([r[key] for r in self.rows], dtype=dtype)
                   for key, dtype in dtypes.items()}
+        observations = stack_observations(row["observations"] for row in self.rows)
+        arrays.update({f"obs_{name}": value for name, value in observations.items()})
         np.savez_compressed(self.directory / filename, **arrays)
         self.shards.append({"file": filename, "examples": len(self.rows)})
         self.rows.clear()
@@ -127,7 +132,10 @@ def prepare_dataset(args):
     for writer in writers.values():
         writer.flush()
     manifest = {
-        "format_version": 2, "observation_dim": 1149, "action_dim": 32,
+        "format_version": DATASET_FORMAT_VERSION,
+        "action_dim": 32,
+        "observation_fields": {name: {"shape": list(shape), "dtype": "int8"}
+                               for name, (shape, _, _) in OBSERVATION_SPECS.items()},
         "args": vars(args), "counts": dict(counts), "error_examples": errors,
         "splits": {split: writer.shards for split, writer in writers.items()},
     }

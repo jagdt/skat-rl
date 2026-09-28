@@ -326,113 +326,47 @@ std::vector<bool> FastSkatGame::legal_mask_array() const {
     return values;
 }
 
-std::vector<float> FastSkatGame::observation(int player) const {
+StructuredObservation FastSkatGame::build_observation(int player) const {
     validate_player(player);
-    std::vector<float> obs;
-    obs.reserve(
-        kNumCards
-        + kMaxTricks * kTrickSize * kNumCards
-        + kMaxTricks * kTrickSize * kNumPlayers
-        + kNumCards
-        + kNumPlayers
-        + kNumPlayers
-        + kNumPlayers
-        + 3
-        + 4
-        + 1
-        + 1
-        + 2
-        + kNumPlayers * 5
-    );
-
-    const auto append_one_hot = [&obs](int size, int index) {
-        for (int i = 0; i < size; ++i) {
-            obs.push_back(i == index ? 1.0F : 0.0F);
-        }
-    };
-
-    const auto append_card_one_hot = [&obs](int card) {
-        for (int i = 0; i < kNumCards; ++i) {
-            obs.push_back(i == card ? 1.0F : 0.0F);
-        }
-    };
-
+    StructuredObservation obs;
+    obs.phase = terminated_ ? TERMINAL : CARD_PLAY;
+    obs.contract = game_kind_ == SUIT ? trump_suit_ :
+                   (game_kind_ == GRAND ? GRAND_CONTRACT : NULL_CONTRACT);
+    obs.relative_declarer = (declarer_ - player + kNumPlayers) % kNumPlayers;
+    const int leader = trick_pos_ > 0 ? current_trick_players_[0] : current_player_;
+    obs.relative_current_leader = (leader - player + kNumPlayers) % kNumPlayers;
+    obs.current_trick = std::min(trick_index_, kMaxTricks - 1);
+    // Only public trick points, never the hidden Skat.
+    obs.declarer_points = declarer_points();
+    obs.defender_points = defender_points();
     for (int card = 0; card < kNumCards; ++card) {
-        obs.push_back((hands_[player] & (uint32_t{1} << card)) ? 1.0F : 0.0F);
-    }
-
-    for (int trick = 0; trick < kMaxTricks; ++trick) {
-        for (int slot = 0; slot < kTrickSize; ++slot) {
-            int card = -1;
-            if (trick < trick_index_) {
-                card = history_cards_[trick][slot];
-            } else if (trick == trick_index_ && slot < trick_pos_) {
-                card = current_trick_cards_[slot];
-            }
-            append_card_one_hot(card);
+        if (hands_[player] & (uint32_t{1} << card)) {
+            obs.card_status[card] = OWN;
         }
     }
-
-    for (int trick = 0; trick < kMaxTricks; ++trick) {
-        for (int slot = 0; slot < kTrickSize; ++slot) {
-            int card_player = -1;
-            if (trick < trick_index_) {
-                card_player = history_players_[trick][slot];
-            } else if (trick == trick_index_ && slot < trick_pos_) {
-                card_player = current_trick_players_[slot];
-            }
-            append_one_hot(kNumPlayers, card_player);
-        }
-    }
-
-    uint32_t current_trick_mask = 0;
-    for (int slot = 0; slot < trick_pos_; ++slot) {
-        current_trick_mask |= (uint32_t{1} << current_trick_cards_[slot]);
-    }
-    for (int card = 0; card < kNumCards; ++card) {
-        obs.push_back((current_trick_mask & (uint32_t{1} << card)) ? 1.0F : 0.0F);
-    }
-
-    append_one_hot(kNumPlayers, current_player_);
-    append_one_hot(kNumPlayers, trick_pos_ > 0 ? current_trick_players_[0] : current_player_);
-    append_one_hot(kNumPlayers, declarer_);
-    append_one_hot(3, game_kind_);
-
-    for (int suit = 0; suit < 4; ++suit) {
-        obs.push_back(game_kind_ == SUIT && trump_suit_ == suit ? 1.0F : 0.0F);
-    }
-
-    obs.push_back(static_cast<float>(trick_index_) / 10.0F);
-    obs.push_back(static_cast<float>(trick_pos_) / 3.0F);
-    obs.push_back(static_cast<float>(declarer_points()) / 120.0F);
-    obs.push_back(static_cast<float>(defender_points()) / 120.0F);
-
-    std::array<std::array<float, 5>, kNumPlayers> void_info{};
-    const auto mark_voids = [this, &void_info](const std::array<int, kTrickSize>& cards,
-                                               const std::array<int, kTrickSize>& players,
-                                               int size) {
-        if (size < 2) {
+    const auto record_trick = [&](const auto& cards, const auto& players, int trick, int size) {
+        if (size == 0) {
             return;
         }
         const int required_suit = effective_suit(cards[0], game_kind_, trump_suit_);
-        for (int slot = 1; slot < size; ++slot) {
-            if (effective_suit(cards[slot], game_kind_, trump_suit_) != required_suit) {
-                void_info[players[slot]][required_suit] = 1.0F;
+        for (int slot = 0; slot < size; ++slot) {
+            const int card = cards[slot];
+            const int relative_player = (players[slot] - player + kNumPlayers) % kNumPlayers;
+            obs.card_status[card] = PLAYED;
+            obs.played_by[card] = relative_player;
+            obs.trick_index[card] = trick;
+            obs.trick_slot[card] = slot;
+            if (slot > 0 && effective_suit(card, game_kind_, trump_suit_) != required_suit) {
+                obs.void_info[relative_player * 5 + required_suit] = 1;
             }
         }
     };
-
     for (int trick = 0; trick < trick_index_; ++trick) {
-        mark_voids(history_cards_[trick], history_players_[trick], kTrickSize);
+        record_trick(history_cards_[trick], history_players_[trick], trick, kTrickSize);
     }
-    mark_voids(current_trick_cards_, current_trick_players_, trick_pos_);
-
-    for (int p = 0; p < kNumPlayers; ++p) {
-        for (int suit = 0; suit < 5; ++suit) {
-            obs.push_back(void_info[p][suit]);
-        }
+    if (!terminated_) {
+        record_trick(current_trick_cards_, current_trick_players_, trick_index_, trick_pos_);
     }
-
     return obs;
 }
 
@@ -832,14 +766,12 @@ std::vector<int> BatchedFastSkatEnv::active_indices() const {
     return indices;
 }
 
-std::vector<float> BatchedFastSkatEnv::active_observations() const {
-    const std::vector<int> indices = active_indices();
-    std::vector<float> observations;
-    observations.reserve(indices.size() * kObservationDim);
-    for (int env_index : indices) {
-        const FastSkatGame& game = games_[env_index];
-        std::vector<float> observation = game.observation(game.current_player());
-        observations.insert(observations.end(), observation.begin(), observation.end());
+std::vector<StructuredObservation> BatchedFastSkatEnv::active_observations() const {
+    std::vector<StructuredObservation> observations;
+    observations.reserve(active_count());
+    for (int index : active_indices()) {
+        const auto& game = games_[index];
+        observations.push_back(game.build_observation(game.current_player()));
     }
     return observations;
 }
@@ -895,10 +827,6 @@ int BatchedFastSkatEnv::size() const {
 
 int BatchedFastSkatEnv::learning_player() const {
     return learning_player_;
-}
-
-int BatchedFastSkatEnv::observation_dim() const {
-    return kObservationDim;
 }
 
 int BatchedFastSkatEnv::action_dim() const {

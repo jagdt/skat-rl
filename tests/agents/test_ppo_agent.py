@@ -10,6 +10,10 @@ from skat_rl.agents.ppo_agent import (  # noqa: E402
     SkatObservationTokenizer,
     SkatTransformerActorCritic,
     masked_categorical,
+    observation_to_tensors,
+)
+from skat_rl.envs.observations import (
+    CardStatus, Contract, OBSERVATION_SPECS, empty_observations, index_observations,
 )
 
 
@@ -40,9 +44,9 @@ def test_masked_categorical_rejects_empty_legal_action_rows():
 
 
 def test_agent_act_respects_action_mask_when_only_one_action_is_legal():
-    config = PPOConfig(observation_dim=5, action_dim=4, hidden_sizes=(8,))
+    config = PPOConfig(action_dim=4, hidden_sizes=(8,))
     agent = PPOAgent(config, device="cpu")
-    observation = np.zeros(5, dtype=np.float32)
+    observation = empty_observations()
     mask = np.array([False, False, True, False])
 
     assert agent.act(observation, mask, deterministic=False) == 2
@@ -50,9 +54,9 @@ def test_agent_act_respects_action_mask_when_only_one_action_is_legal():
 
 
 def test_get_action_and_value_returns_one_result_per_observation():
-    config = PPOConfig(observation_dim=5, action_dim=4, hidden_sizes=(8,))
+    config = PPOConfig(action_dim=4, hidden_sizes=(8,))
     agent = PPOAgent(config, device="cpu")
-    observations = np.zeros((3, 5), dtype=np.float32)
+    observations = empty_observations((3,))
     masks = np.array(
         [
             [True, False, False, False],
@@ -72,11 +76,10 @@ def test_rollout_buffer_computes_gae_returns_and_flattens_batch():
     buffer = RolloutBuffer(
         rollout_steps=3,
         n_envs=1,
-        observation_dim=2,
         action_dim=2,
     )
 
-    observations = np.zeros((1, 2), dtype=np.float32)
+    observations = empty_observations((1,))
     action_masks = np.ones((1, 2), dtype=bool)
     for step, reward in enumerate([1.0, 1.0, 1.0]):
         buffer.add(
@@ -102,7 +105,7 @@ def test_rollout_buffer_computes_gae_returns_and_flattens_batch():
 
     batch = buffer.flatten()
 
-    assert batch.observations.shape == (3, 2)
+    assert batch.observations["card_status"].shape == (3, 32)
     assert batch.actions.shape == (3,)
     assert batch.action_masks.shape == (3, 2)
 
@@ -110,7 +113,6 @@ def test_rollout_buffer_computes_gae_returns_and_flattens_batch():
 def test_agent_update_returns_metrics_and_changes_parameters():
     torch.manual_seed(1)
     config = PPOConfig(
-        observation_dim=4,
         action_dim=3,
         hidden_sizes=(8,),
         update_epochs=2,
@@ -120,16 +122,15 @@ def test_agent_update_returns_metrics_and_changes_parameters():
     rollout = RolloutBuffer(
         rollout_steps=4,
         n_envs=1,
-        observation_dim=config.observation_dim,
         action_dim=config.action_dim,
     )
-    observations = np.arange(4, dtype=np.float32).reshape(1, 4)
+    observations = empty_observations((1,))
     action_masks = np.ones((1, 3), dtype=bool)
 
     for step in range(4):
         rollout.add(
             step,
-            observations + step,
+            {**observations, "current_trick": np.array([step], dtype=np.int8)},
             np.array([step % config.action_dim]),
             np.array([-1.0], dtype=np.float32),
             np.array([1.0 if step == 3 else 0.25], dtype=np.float32),
@@ -166,13 +167,14 @@ def test_agent_update_returns_metrics_and_changes_parameters():
 
 
 def test_agent_save_and_load_round_trip(tmp_path):
-    config = PPOConfig(observation_dim=5, action_dim=4, hidden_sizes=(8,))
+    config = PPOConfig(action_dim=4, hidden_sizes=(8,))
     agent = PPOAgent(config, device="cpu")
     path = tmp_path / "model.pt"
 
     agent.save(path)
     loaded = PPOAgent.load(path, device="cpu")
 
+    assert "observation_version" not in torch.load(path, weights_only=True)["config"]
     assert loaded.config == agent.config
     for name, parameter in agent.model.state_dict().items():
         assert torch.equal(parameter, loaded.model.state_dict()[name])
@@ -180,7 +182,6 @@ def test_agent_save_and_load_round_trip(tmp_path):
 
 def _tiny_transformer_config(**overrides):
     values = {
-        "observation_dim": 1149,
         "action_dim": 32,
         "architecture": "transformer",
         "use_belief": True,
@@ -195,58 +196,102 @@ def _tiny_transformer_config(**overrides):
     return PPOConfig(**values)
 
 
-def test_tokenizer_uses_relative_players_and_ordered_play_history():
+def test_tokenizer_uses_explicit_card_status_and_relative_players():
     tokenizer = SkatObservationTokenizer(model_dim=16)
-    observations = np.zeros((2, 1149), dtype=np.float32)
-    observations[:, 8] = 1.0  # Own spade seven.
-    observations[:, 32 + 6] = 1.0  # Club ace was played in the first slot.
-    observations[:, 1123] = 1.0  # Suit game.
-    observations[:, 1128] = 1.0  # Hearts trump.
-
-    for row, current_player in enumerate([0, 1]):
-        observations[row, 1114 + current_player] = 1.0
-        observations[row, 1117 + (current_player + 2) % 3] = 1.0
-        observations[row, 1120 + (current_player + 1) % 3] = 1.0
-        observations[row, 992 + (current_player + 1) % 3] = 1.0
-
-    tokens = tokenizer(torch.as_tensor(observations))
-
+    observations = empty_observations((2,))
+    observations["card_status"][:, 8] = CardStatus.OWN
+    observations["card_status"][:, 6] = CardStatus.PLAYED
+    observations["played_by"][:, 6] = 1
+    observations["trick_index"][:, 6] = 0
+    observations["trick_slot"][:, 6] = 0
+    observations["contract"][:] = Contract.HEARTS
+    observations["relative_declarer"][:] = 1
+    observations["relative_current_leader"][:] = 2
+    tensors = observation_to_tensors(observations, "cpu")
+    tokens = tokenizer(tensors)
     assert tokens.shape == (2, 33, 16)
-    assert torch.allclose(tokens[0], tokens[1])
+    torch.testing.assert_close(tokens[0], tokens[1])
 
-    without_history = observations[:1].copy()
-    without_history[0, 32 + 6] = 0.0
-    without_history[0, 992 + 1] = 0.0
-    unplayed_tokens = tokenizer(torch.as_tensor(without_history))
-    assert not torch.allclose(tokens[0, 1 + 6], unplayed_tokens[0, 1 + 6])
+    changed = {key: value.clone() for key, value in tensors.items()}
+    changed["played_by"][0, 6] = 2
+    changed_tokens = tokenizer(changed)
+    assert not torch.allclose(tokens[0, 7], changed_tokens[0, 7])
+    torch.testing.assert_close(tokens[0, 9], changed_tokens[0, 9])
 
 
-def test_tokenizer_linearly_projects_normalized_played_trick_progress():
+def test_tokenizer_ignores_unplayed_card_metadata():
     tokenizer = SkatObservationTokenizer(model_dim=16)
-    observations = np.zeros((2, 1149), dtype=np.float32)
-    observations[:, 1114] = 1.0  # Player 0 is acting.
-    observations[:, 1117] = 1.0  # Player 0 leads.
-    observations[:, 1120] = 1.0  # Player 0 is declarer.
-    observations[:, 1123] = 1.0  # Suit game.
-    observations[:, 1126] = 1.0  # Clubs trump.
+    observations = observation_to_tensors(empty_observations((2,)), "cpu")
+    expected = tokenizer(observations)
+    for field in ("played_by", "trick_index", "trick_slot"):
+        observations[field].fill_(99)
+    torch.testing.assert_close(expected, tokenizer(observations))
 
-    card_id = 6
-    observations[0, 32 + card_id] = 1.0  # Card in trick 0, slot 0.
-    observations[0, 992] = 1.0
 
-    final_trick_history_slot = 27
-    observations[1, 32 + final_trick_history_slot * 32 + card_id] = 1.0
-    observations[1, 992 + final_trick_history_slot * 3] = 1.0
-
-    tokens = tokenizer(torch.as_tensor(observations))
-
+def test_tokenizer_projects_trick_index_and_numeric_state_with_documented_scale():
+    tokenizer = SkatObservationTokenizer(model_dim=16)
+    observations = empty_observations((2,))
+    observations["card_status"][:, 6] = CardStatus.PLAYED
+    observations["played_by"][:, 6] = 0
+    observations["trick_index"][:, 6] = [0, 9]
+    observations["trick_slot"][:, 6] = [0, 2]
+    observations["card_status"][:, 8] = CardStatus.PLAYED
+    observations["played_by"][:, 8] = 1
+    observations["trick_index"][:, 8] = [0, 9]
+    observations["trick_slot"][:, 8] = 1
+    observations["declarer_points"][:] = [60, 120]
+    observations["defender_points"][:] = [30, 0]
+    observations["current_trick"][:] = [0, 9]
+    inputs = {}
+    trick_hook = tokenizer.trick_index_projection.register_forward_pre_hook(
+        lambda module, args: inputs.update(trick_index=args[0].clone()))
+    numeric_hook = tokenizer.numeric_state_projection.register_forward_pre_hook(
+        lambda module, args: inputs.update(numeric=args[0].clone()))
+    tokens = tokenizer(observation_to_tensors(observations, "cpu"))
+    trick_hook.remove()
+    numeric_hook.remove()
     assert tokens.shape == (2, 33, 16)
-    assert not torch.allclose(tokens[0, 1 + card_id], tokens[1, 1 + card_id])
+    torch.testing.assert_close(inputs["trick_index"][:, 6, 0], torch.tensor([0., 1.]))
+    torch.testing.assert_close(inputs["trick_index"][:, 6], inputs["trick_index"][:, 8])
+    torch.testing.assert_close(inputs["numeric"], torch.tensor([[.5, .25, 0.], [1., 0., 1.]]))
+
+
+def test_observation_conversion_rejects_flat_or_privileged_inputs():
+    with pytest.raises(ValueError, match="structured policy"):
+        observation_to_tensors(np.zeros((1, 1149)), "cpu")
+    observations = empty_observations((1,))
+    observations["belief_targets"] = np.zeros((1, 32))
+    with pytest.raises(ValueError, match="structured policy"):
+        observation_to_tensors(observations, "cpu")
+
+
+def test_rollout_fields_stay_aligned_across_time_env_and_minibatch():
+    buffer = RolloutBuffer(3, 2, 32)
+    for step in range(3):
+        observations = empty_observations((2,))
+        observations["declarer_points"][:] = [step * 2, step * 2 + 1]
+        observations["played_by"][:, 5] = [0, 1]
+        buffer.add(step, observations, np.array([step * 2, step * 2 + 1]),
+                   np.zeros(2), np.zeros(2), np.zeros(2), np.zeros(2),
+                   np.ones((2, 32), dtype=bool))
+        observations["declarer_points"][:] = 99
+    batch = buffer.flatten()
+    assert set(batch.observations) == set(OBSERVATION_SPECS)
+    for field, (shape, _, _) in OBSERVATION_SPECS.items():
+        assert batch.observations[field].shape == (6,) + shape
+        assert np.shares_memory(batch.observations[field], buffer.observations[field])
+    indices = np.array([5, 0, 3])
+    selected = index_observations(batch.observations, indices)
+    np.testing.assert_array_equal(selected["declarer_points"], batch.actions[indices])
+    tensors = observation_to_tensors(batch.observations, "cpu")
+    torch.testing.assert_close(
+        index_observations(tensors, torch.tensor(indices))["declarer_points"],
+        torch.tensor([5, 0, 3]))
 
 
 def test_transformer_outputs_policy_value_and_card_beliefs():
     agent = PPOAgent(_tiny_transformer_config(), device="cpu")
-    observations = np.zeros((2, 1149), dtype=np.float32)
+    observations = empty_observations((2,))
     action_masks = np.ones((2, 32), dtype=bool)
 
     actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
@@ -261,7 +306,7 @@ def test_transformer_outputs_policy_value_and_card_beliefs():
 
 def test_auxiliary_belief_does_not_feed_policy_or_value_heads():
     model = SkatTransformerActorCritic(_tiny_transformer_config())
-    observations = torch.zeros((2, 1149))
+    observations = observation_to_tensors(empty_observations((2,)), "cpu")
 
     policy_logits, values, belief_logits = model.outputs(observations)
     rollout_policy_logits, rollout_values, rollout_beliefs = model.outputs(
@@ -289,8 +334,8 @@ def test_transformer_update_trains_belief_head_with_supervised_targets():
     torch.manual_seed(3)
     config = _tiny_transformer_config()
     agent = PPOAgent(config, device="cpu")
-    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim, use_belief=True)
-    observations = np.zeros((1, config.observation_dim), dtype=np.float32)
+    rollout = RolloutBuffer(2, 1, config.action_dim, use_belief=True)
+    observations = empty_observations((1,))
     masks = np.ones((1, config.action_dim), dtype=bool)
     targets = np.arange(config.action_dim, dtype=np.int64)[None, :] % 3
 
@@ -325,11 +370,11 @@ def test_transformer_update_trains_belief_head_with_supervised_targets():
 def test_transformer_without_belief_has_only_policy_and_value_heads(tmp_path):
     config = _tiny_transformer_config(use_belief=False)
     agent = PPOAgent(config, device="cpu")
-    observations = np.zeros((2, config.observation_dim), dtype=np.float32)
+    observations = empty_observations((2,))
     masks = np.ones((2, config.action_dim), dtype=bool)
 
     actions, log_probs, values = agent.get_action_and_value(observations, masks)
-    _, _, belief_logits = agent.model.outputs(torch.as_tensor(observations))
+    _, _, belief_logits = agent.model.outputs(observation_to_tensors(observations, "cpu"))
 
     assert actions.shape == log_probs.shape == values.shape == (2,)
     assert belief_logits is None
@@ -349,8 +394,8 @@ def test_transformer_without_belief_has_only_policy_and_value_heads(tmp_path):
 def test_transformer_without_belief_updates_without_targets():
     config = _tiny_transformer_config(use_belief=False)
     agent = PPOAgent(config, device="cpu")
-    rollout = RolloutBuffer(2, 1, config.observation_dim, config.action_dim, use_belief=False)
-    observations = np.zeros((1, config.observation_dim), dtype=np.float32)
+    rollout = RolloutBuffer(2, 1, config.action_dim, use_belief=False)
+    observations = empty_observations((1,))
     masks = np.ones((1, config.action_dim), dtype=bool)
 
     for step in range(2):
@@ -373,31 +418,13 @@ def test_transformer_without_belief_updates_without_targets():
 
 
 def test_transformer_config_defaults_to_no_belief():
-    config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=32, architecture="transformer",
                        transformer_dim=32, transformer_layers=1, transformer_heads=4,
                        transformer_ff_dim=64)
     agent = PPOAgent(config, device="cpu")
 
     assert config.use_belief is False
     assert not hasattr(agent.model, "belief_head")
-
-
-def test_legacy_transformer_checkpoint_without_use_belief_stays_enabled(tmp_path):
-    config = _tiny_transformer_config()
-    agent = PPOAgent(config, device="cpu")
-    path = tmp_path / "legacy_model.pt"
-    agent.save(path)
-    checkpoint = torch.load(path, map_location="cpu")
-    del checkpoint["config"]["use_belief"]
-    checkpoint["config"]["belief_decoder_layers"] = 2
-    checkpoint["config"]["belief_detach_updates"] = 100
-    torch.save(checkpoint, path)
-
-    loaded = PPOAgent.load(path, device="cpu")
-
-    assert loaded.config.use_belief is True
-    assert hasattr(loaded.model, "belief_head")
-    assert "belief_decoder_layers" not in loaded.config.__dict__
 
 
 def test_incompatible_transformer_checkpoint_has_clear_error(tmp_path):

@@ -1,5 +1,7 @@
 import random
 
+import numpy as np
+
 import pytest
 
 from skat_rl._skat_cpp import FastSkatGame
@@ -7,6 +9,7 @@ from skat_rl.engine.cards import card_points
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.rules import points_won_by_player
 from skat_rl.engine.scoring import tournament_rewards
+from skat_rl.envs.observations import build_observation
 from skat_rl.engine.state import GameKind, GameState, GameType, Trick
 
 
@@ -77,6 +80,13 @@ def test_cpp_matches_python_engine_for_seeded_deals(game_kind, hand_game):
             cpp_legal = cpp_game.legal_actions()
             assert cpp_legal == py_legal
 
+            player = py_game.state.current_player
+            expected = build_observation(py_game.state, player)
+            actual = cpp_game.observation(player)
+            assert actual.keys() == expected.keys()
+            for name in expected:
+                np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
+
             action = rng.choice(py_legal)
             py_result = py_game.step(action)
             cpp_result = cpp_game.step(action)
@@ -95,9 +105,15 @@ def test_cpp_matches_python_engine_for_seeded_deals(game_kind, hand_game):
             )
             if not py_result.terminated:
                 assert cpp_result["declarer_points"] == cpp_game.declarer_points()
-                assert cpp_game.observation(cpp_game.current_player())[1132] == pytest.approx(
-                    points_won_by_player(py_game.state.won_cards, declarer) / 120.0
+                assert cpp_game.observation(cpp_game.current_player())["declarer_points"] == pytest.approx(
+                    points_won_by_player(py_game.state.won_cards, declarer)
                 )
+
+        for player in range(3):
+            expected = build_observation(py_game.state, player)
+            actual = cpp_game.observation(player)
+            for name in expected:
+                np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
 
         terminal_rewards = py_result.reward
         py_result = py_result.info["result"]

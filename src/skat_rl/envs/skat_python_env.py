@@ -4,7 +4,7 @@ from gymnasium import spaces
 
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.rules import effective_suit
-from skat_rl.envs.observations import encode_observation, encode_belief_targets
+from skat_rl.envs.observations import build_observation, encode_belief_targets, observation_space
 from skat_rl.agents.heuristic_agent import HeuristicAgent
 from skat_rl.agents.random_agent import RandomAgent
 
@@ -19,20 +19,8 @@ class SkatSingleAgentEnv(gym.Env):
     Action space:
         Discrete(32), one action per card.
 
-    Observation:
-        A flat vector containing:
-        - own hand
-        - ordered history cards
-        - ordered history players
-        - current trick cards
-        - current player one-hot
-        - current trick leader one-hot
-        - declarer one-hot
-        - game type/trump encoding
-        - trick number
-        - current trick position
-        - current declarer and defender points
-        - void information
+    Observation: semantic per-card and global fields in the learning player's
+    SELF/LEFT/RIGHT coordinates. Privileged belief labels are returned separately.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -55,28 +43,7 @@ class SkatSingleAgentEnv(gym.Env):
 
         self.action_space = spaces.Discrete(32)
 
-        obs_dim = (
-            32              # own hand
-            + 10 * 3 * 32   # history cards
-            + 10 * 3 * 3    # history players
-            + 32             # current trick cards
-            + 3             # current player
-            + 3             # current trick leader
-            + 3             # declarer
-            + 3             # game kind
-            + 4             # trump suit
-            + 1             # trick number
-            + 1             # current trick position
-            + 2             # declarer and defender points
-            + 3 * 5         # void info
-        )
-
-        self.observation_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(obs_dim,),
-            dtype=np.float32,
-        )
+        self.observation_space = observation_space()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -199,7 +166,7 @@ class SkatSingleAgentEnv(gym.Env):
         return total_reward, info
 
     def _get_observation(self):
-        return encode_observation(
+        return build_observation(
             self.game.state, self.learning_player, self._void_info()
         )
 

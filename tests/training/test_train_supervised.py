@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 import torch
 
-from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig
+from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, observation_to_tensors
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.state import GameKind, GameType
-from skat_rl.envs.observations import encode_observation
+from skat_rl.envs.observations import (
+    CardStatus, OBSERVATION_SPECS, DATASET_FORMAT_VERSION, build_observation,
+)
 from skat_rl.training.iss_data import (
     RecordError, decode_game, open_records, parse_record, player_rating, replay_examples,
 )
@@ -99,12 +101,12 @@ def test_real_record_replays_pickup_discards_and_teacher_selection():
     assert len(examples) == 10
     assert [e["remaining_decisions"] for e in examples] == list(range(9, -1, -1))
     assert [e["terminal_rewards"] for e in examples] == pytest.approx([0.98] * 10)
-    assert all(example["observations"][1116] == 1 for example in examples)
+    assert all(example["observations"]["relative_declarer"] == 0 for example in examples)
     for example in examples:
         assert example["action_masks"][example["actions"]]
-        assert example["observations"][example["actions"]] == 1
+        assert example["observations"]["card_status"][example["actions"]] == CardStatus.OWN
         assert example["belief_targets"][example["actions"]] == -1
-        assert np.all(example["observations"][:32][example["belief_targets"] >= 0] == 0)
+        assert np.all(example["observations"]["card_status"][example["belief_targets"] >= 0] == CardStatus.UNKNOWN)
     assert record.game.state.terminated
 
 
@@ -141,7 +143,10 @@ def test_replay_observations_match_cpp_engine():
     cpp.reset_from_deal([sorted(hand) for hand in state.hands], state.skat,
                         state.declarer, 0, int(state.game_type.trump_suit), 0)
     for player, action in record.plays:
-        assert encode_observation(state, player) == pytest.approx(cpp.observation(player))
+        expected = build_observation(state, player)
+        actual = cpp.observation(player)
+        for name in expected:
+            np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
         game.step(action)
         cpp.step(action)
 
@@ -171,7 +176,14 @@ def test_shards_exclude_weak_players_and_keep_games_in_one_split(prepared):
         for shard in manifest["splits"][split]:
             with np.load(directory / shard["file"]) as data:
                 identities[split].update(data["game_ids"].tolist())
-                assert np.all(data["observations"][:, 1115] == 0)  # Bob is below 1000.
+                # Generated games use seed % 3 as declarer; recover seat only in this test.
+                declarers = np.array([int(json.loads(identity)[1]) % 3 for identity in data["game_ids"]])
+                teachers = (declarers - data["obs_relative_declarer"]) % 3
+                assert np.all(teachers != 1)  # Bob is below 1000.
+                assert "observations" not in data
+                for name, (shape, _, _) in OBSERVATION_SPECS.items():
+                    assert data[f"obs_{name}"].shape == (len(data["actions"]),) + shape
+                    assert data[f"obs_{name}"].dtype == np.int8
                 assert np.all(data["action_masks"].sum(axis=1) >= 1)
                 count += len(data["actions"])
         assert count == manifest["counts"][f"{split}_examples"]
@@ -196,7 +208,8 @@ def test_rating_and_history_filters_apply_to_formerly_trusted_names(tmp_path):
         assert manifest["counts"][f"{split}_examples"] == 10 * manifest["counts"][f"{split}_games"]
         for shard in manifest["splits"][split]:
             with np.load(output / shard["file"]) as data:
-                assert np.all(data["observations"][:, 1114] == 1)  # Only the rated, eligible player.
+                declarers = np.array([int(json.loads(identity)[1]) % 3 for identity in data["game_ids"]])
+                assert np.all((declarers - data["obs_relative_declarer"]) % 3 == 0)
 
 
 def test_prepare_can_exclude_forced_moves(tmp_path):
@@ -215,7 +228,7 @@ def test_prepare_can_exclude_forced_moves(tmp_path):
 def test_supervised_epoch_updates_policy_and_optional_value_head(prepared, value_coef):
     torch.set_num_threads(1)
     directory, _ = prepared
-    config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=32, architecture="transformer",
                        transformer_dim=16, transformer_layers=1, transformer_heads=2,
                        transformer_ff_dim=32, use_belief=True, value_coef=value_coef)
     agent = PPOAgent(config, device="cpu")
@@ -232,10 +245,11 @@ def test_supervised_epoch_updates_policy_and_optional_value_head(prepared, value
     assert (metrics["value_loss"] > 0) == (value_coef > 0)
 
 
-def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared, tmp_path):
+@pytest.mark.parametrize("workers", [0, 2])
+def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared, tmp_path, workers):
     directory, _ = prepared
     args = argparse.Namespace(dataset=str(directory), output_dir=str(tmp_path / "model"), epochs=1,
-                              batch_size=32, patience=2, workers=0, torch_threads=1, seed=42,
+                              batch_size=32, patience=2, workers=workers, torch_threads=1, seed=42,
                               device="cpu", transformer_dim=16, transformer_layers=1,
                               transformer_heads=2, transformer_ff_dim=32, transformer_dropout=0.0,
                               learning_rate=1e-3, belief=False, belief_coef=.05,
@@ -243,7 +257,7 @@ def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared,
     path = train(args)
     loaded = PPOAgent.load(path, device="cpu")
     assert torch.load(path, weights_only=True)["critic_pretrained"] is True
-    config = PPOConfig(observation_dim=1149, action_dim=32, learning_rate=2e-4, gamma=.95)
+    config = PPOConfig(action_dim=32, learning_rate=2e-4, gamma=.95)
     ppo = initialize_agent(config, path, device="cpu")
     assert ppo.config.transformer_dim == 16
     assert ppo.config.learning_rate == 2e-4
@@ -271,20 +285,20 @@ def test_outcomes_are_discounted_by_player_decisions_not_selected_examples():
     selected = replay_examples(record, [False, False, True], include_forced=False)
     assert len(selected) < 10
     for example in selected:
-        assert example["remaining_decisions"] == sum(example["observations"][:32]) - 1
+        assert example["remaining_decisions"] == np.count_nonzero(example["observations"]["card_status"] == CardStatus.OWN) - 1
         assert example["terminal_rewards"] == pytest.approx(.98)
 
 
 def test_value_loss_uses_discounted_outcome(prepared):
     directory, _ = prepared
-    config = PPOConfig(observation_dim=1149, action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=32, architecture="transformer",
                        transformer_dim=16, transformer_layers=1, transformer_heads=2,
                        transformer_ff_dim=32, gamma=.8)
     agent = PPOAgent(config, device="cpu")
     agent.model.eval()
     batch = next(iter(SupervisedBatches(directory, "train", 32)))
     with torch.no_grad():
-        predicted = agent.model.outputs(batch["observations"])[1]
+        predicted = agent.model.outputs(observation_to_tensors(batch["observations"], "cpu"))[1]
         targets = batch["terminal_rewards"] * .8 ** batch["remaining_decisions"].float()
         expected = .5 * ((predicted - targets) ** 2).mean().item()
     before = {name: p.clone() for name, p in agent.model.state_dict().items()}
@@ -294,21 +308,17 @@ def test_value_loss_uses_discounted_outcome(prepared):
     assert all(torch.equal(before[n], p) for n, p in agent.model.state_dict().items())
 
 
-def test_legacy_shards_require_repreparation_for_value_training(prepared):
+@pytest.mark.parametrize("field,value", [
+    ("format_version", 2), ("action_dim", 31),
+])
+def test_obsolete_or_incompatible_shards_require_repreparation(prepared, field, value):
     directory, manifest = prepared
-    manifest["format_version"] = 1
+    assert manifest["format_version"] == DATASET_FORMAT_VERSION
+    assert "observation_version" not in manifest
+    assert set(manifest["observation_fields"]) == set(OBSERVATION_SPECS)
+    manifest[field] = value
     (directory / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="no outcome labels"):
-        SupervisedBatches(directory, "train", 32)
-    batch = next(iter(SupervisedBatches(directory, "train", 32, require_value_targets=False)))
-    assert "terminal_rewards" not in batch
-
-
-def test_dataset_reward_scheme_must_match_ppo(prepared):
-    directory, manifest = prepared
-    manifest["reward_scheme"] = "other"
-    (directory / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="reward scheme"):
+    with pytest.raises(ValueError, match="Regenerate with prepare_supervised"):
         SupervisedBatches(directory, "train", 32)
 
 

@@ -12,7 +12,7 @@ import numpy as np
 from skat_rl.engine.cards import Rank, Suit, make_card
 from skat_rl.engine.game import SkatGame
 from skat_rl.engine.state import GameKind, GameState, GameType, Trick
-from skat_rl.envs.observations import encode_observation, encode_belief_targets
+from skat_rl.envs.observations import build_observation, encode_belief_targets
 
 
 PROPERTY = re.compile(r"([A-Z][A-Z0-9]*)\[((?:\\.|[^\\\]])*)\]", re.DOTALL)
@@ -197,7 +197,7 @@ def replay_examples(record, eligible_players, role="both", include_forced=True):
             mask = np.zeros(32, dtype=bool)
             mask[legal] = True
             examples.append({
-                "observations": encode_observation(game.state, player),
+                "observations": build_observation(game.state, player),
                 "action_masks": mask,
                 "actions": action,
                 "belief_targets": encode_belief_targets(game.state, player),

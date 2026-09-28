@@ -75,12 +75,38 @@ std::vector<uint64_t> uint64_vector_from_sequence(const py::sequence& values) {
     return result;
 }
 
-py::array_t<float> float_array(const std::vector<float>& values, py::ssize_t rows, py::ssize_t cols) {
-    py::array_t<float> array({rows, cols});
-    if (!values.empty()) {
-        std::memcpy(array.mutable_data(), values.data(), values.size() * sizeof(float));
+template <typename T>
+py::array_t<int8_t> observation_field(
+    const std::vector<skat_rl::StructuredObservation>& observations,
+    T skat_rl::StructuredObservation::* member, std::vector<py::ssize_t> shape, bool batched
+) {
+    if (batched) {
+        shape.insert(shape.begin(), static_cast<py::ssize_t>(observations.size()));
     }
-    return array;
+    py::array_t<int8_t> result(shape);
+    for (std::size_t row = 0; row < observations.size(); ++row) {
+        std::memcpy(result.mutable_data() + row * sizeof(T), &(observations[row].*member), sizeof(T));
+    }
+    return result;
+}
+
+py::dict observation_dict(const std::vector<skat_rl::StructuredObservation>& observations,
+                          bool batched = true) {
+    using Observation = skat_rl::StructuredObservation;
+    py::dict result;
+    result["phase"] = observation_field(observations, &Observation::phase, {}, batched);
+    result["card_status"] = observation_field(observations, &Observation::card_status, {32}, batched);
+    result["played_by"] = observation_field(observations, &Observation::played_by, {32}, batched);
+    result["trick_index"] = observation_field(observations, &Observation::trick_index, {32}, batched);
+    result["trick_slot"] = observation_field(observations, &Observation::trick_slot, {32}, batched);
+    result["contract"] = observation_field(observations, &Observation::contract, {}, batched);
+    result["relative_declarer"] = observation_field(observations, &Observation::relative_declarer, {}, batched);
+    result["relative_current_leader"] = observation_field(observations, &Observation::relative_current_leader, {}, batched);
+    result["declarer_points"] = observation_field(observations, &Observation::declarer_points, {}, batched);
+    result["defender_points"] = observation_field(observations, &Observation::defender_points, {}, batched);
+    result["current_trick"] = observation_field(observations, &Observation::current_trick, {}, batched);
+    result["void_info"] = observation_field(observations, &Observation::void_info, {3, 5}, batched);
+    return result;
 }
 
 py::array_t<int> int_array(const std::vector<int>& values) {
@@ -141,11 +167,7 @@ py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
     result["active_indices"] = int_array(env.active_indices());
     result["current_players"] = int_array(env.active_players());
     result["declarers"] = int_array(env.active_declarers());
-    result["observations"] = float_array(
-        env.active_observations(),
-        active_count,
-        skat_rl::kObservationDim
-    );
+    result["observations"] = observation_dict(env.active_observations());
     result["action_masks"] = bool_array(
         env.active_action_masks(),
         active_count,
@@ -198,7 +220,9 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("legal_actions", &skat_rl::FastSkatGame::legal_actions)
         .def("legal_mask_bits", &skat_rl::FastSkatGame::legal_mask_bits)
         .def("legal_mask_array", &skat_rl::FastSkatGame::legal_mask_array)
-        .def("observation", &skat_rl::FastSkatGame::observation, py::arg("player"))
+        .def("observation", [](const skat_rl::FastSkatGame& game, int player) {
+            return observation_dict({game.build_observation(player)}, false);
+        }, py::arg("player"))
         .def("belief_targets", &skat_rl::FastSkatGame::belief_targets, py::arg("player"))
         .def("step", [](skat_rl::FastSkatGame& game, int action) {
             return step_info_to_dict(game.step(action));
@@ -245,7 +269,6 @@ PYBIND11_MODULE(_skat_cpp, m) {
         .def("size", &skat_rl::BatchedFastSkatEnv::size)
         .def("active_count", &skat_rl::BatchedFastSkatEnv::active_count)
         .def("learning_player", &skat_rl::BatchedFastSkatEnv::learning_player)
-        .def("observation_dim", &skat_rl::BatchedFastSkatEnv::observation_dim)
         .def("action_dim", &skat_rl::BatchedFastSkatEnv::action_dim)
         .def("active_indices", [](const skat_rl::BatchedFastSkatEnv& env) {
             return int_array(env.active_indices());
@@ -257,11 +280,7 @@ PYBIND11_MODULE(_skat_cpp, m) {
             return int_array(env.active_declarers());
         })
         .def("observations", [](const skat_rl::BatchedFastSkatEnv& env) {
-            return float_array(
-                env.active_observations(),
-                env.active_count(),
-                skat_rl::kObservationDim
-            );
+            return observation_dict(env.active_observations());
         })
         .def("action_masks", [](const skat_rl::BatchedFastSkatEnv& env) {
             return bool_array(

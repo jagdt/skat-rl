@@ -11,6 +11,33 @@ The Python environment (`skat_rl.envs.skat_python_env`) supports both SB3 and na
 PyTorch training. A batched C++ environment (`skat_rl.envs.skat_cpp_batched_env`)
 is also available.
 
+### Structured Observations
+
+Policy inputs are dictionaries of named integer arrays, described by
+`StructuredSkatObservation` in `envs/observations.py`. A single observation has
+scalar globals and 32-element card arrays; batching adds a leading dimension `B`:
+
+| Field | Batched shape | Meaning |
+| --- | --- | --- |
+| `phase` | `[B]` | `CARD_PLAY=0`, `TERMINAL=1` |
+| `card_status` | `[B, 32]` | `UNKNOWN=0`, `OWN=1`, `PLAYED=2` |
+| `played_by` | `[B, 32]` | Relative player for each played card |
+| `trick_index` | `[B, 32]` | Trick `0..9` in which each card was played |
+| `trick_slot` | `[B, 32]` | Lead, second, third: `0..2` |
+| `contract` | `[B]` | Clubs, spades, hearts, diamonds, Grand, Null: `0..5` |
+| `relative_declarer` | `[B]` | Declarer's relative seat |
+| `relative_current_leader` | `[B]` | Current trick leader's relative seat |
+| `declarer_points`, `defender_points` | `[B]` each | Public points from completed tricks |
+| `current_trick` | `[B]` | Trick index `0..9`; stays `9` at termination |
+| `void_info` | `[B, 3, 5]` | Publicly established voids by relative seat and effective suit |
+
+Relative seats are `SELF=0`, `LEFT=1` (the next seat in engine play order), and
+`RIGHT=2`. Absolute current-player IDs remain rollout-routing metadata, never
+model inputs. Unplayed cards use `-1` for all three play-metadata fields, which
+the tokenizer ignores. Current-trick cards are already `PLAYED` and have the same
+metadata as completed-trick cards. No separate hand/history/current-trick one-hot
+planes are stored.
+
 ## Setup
 
 Create and activate a virtual environment:
@@ -91,7 +118,8 @@ duplicate record IDs and duplicate initial deals are removed across all inputs u
 an on-disk SQLite index. This prevents the same game/deal from appearing on both
 sides. Output directories must not already exist. Memory is bounded by shard size,
 although each training worker decompresses its own shard. The default 32768-row
-shard has about 151 MB of observation data before compression.
+shard has about 4.9 MB of observation array data before compression (150 int8
+values per example), excluding labels and Python/NumPy object overhead.
 
 Train the policy with legal-action-masked cross-entropy and the value head with
 outcome regression:
@@ -116,16 +144,16 @@ loss; `--value-coef` defaults to `0.5`. Training logs `value_loss` for both spli
 Outcomes are labels only, never observations. They estimate returns under the
 recorded players' play; PPO must still adapt the critic to its own policy.
 
-Prepared datasets now use format version 2. Old shards lack outcome labels:
-rerun preparation into a new directory, or use `--value-coef 0` for policy-only
-training on them. Existing datasets are not modified automatically.
+Prepared datasets use format version 3. Each
+shard stores one `obs_<field>` array per named observation field, alongside action
+masks, actions, belief targets, game IDs, and outcome labels.
 
 Belief learning is off by default. `--belief` adds supervised hidden-card prediction
 using labels stored in the shards. Hidden hands and the Skat never enter the policy
 observation. The observation encoder is shared with the Python Gym environment.
 The current observation omits the Hand flag and the declarer's knowledge of
 discarded cards, so it does not capture all information the recorded player
-possessed. The input format is unchanged to preserve checkpoint compatibility.
+possessed.
 
 Initialize PPO with pretrained weights:
 
@@ -135,11 +163,9 @@ python -m skat_rl.training.train_torch_ppo \
 ```
 
 `--init-model` adopts the checkpoint's architecture and weights, while using fresh
-PPO hyperparameters and optimizer state. For checkpoints using the old reward
-scheme, it keeps the policy/encoder weights but resets the value head with a warning.
-`--continue-model` rejects old-reward checkpoints; use `--init-model` for that
-transition. Old models remain usable as frozen opponents. These options are
-mutually exclusive. Pretrained checkpoints also
+PPO hyperparameters and optimizer state. `--continue-model` also restores the
+saved PPO optimizer/configuration. Both require the new observation schema, as
+do frozen opponents. These options are mutually exclusive. Pretrained checkpoints also
 load with `PPOAgent.load()` for evaluation. They omit optimizer state and do not
 support resuming the supervised optimizer/epoch counter.
 
@@ -161,8 +187,7 @@ actual Hand/non-Hand contract.
 
 Rewards are terminal-only and not zero-sum. In particular, a defender loss now
 returns zero, not a negative reward. New return curves are not directly comparable
-with old shaped-reward runs. The reward scheme is stored in dataset manifests and
-native PPO checkpoints to detect incompatible value targets.
+with old shaped-reward runs. There is no old-reward compatibility mode.
 
 ## Self-Play
 
@@ -196,7 +221,8 @@ an explicit alias for the default heuristic selection.
 - `reset()` deals games without autoplaying any cards.
 - State arrays contain `active_indices`, `current_players`, `declarers`,
   `observations`, `action_masks`, and `belief_targets`.
-- Each observation, mask, and belief target belongs to that row's current player.
+- `observations` is a dictionary of the batched fields listed above, not a matrix.
+  Each observation, mask, and belief target belongs to that row's current player.
   Belief targets are privileged supervision labels, never policy inputs.
 - `step(actions)` takes one integer action per active row and plays one card in
   each game inside C++. The entire action batch is validated before any mutation.

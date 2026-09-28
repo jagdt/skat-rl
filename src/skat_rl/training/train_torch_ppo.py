@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, RolloutBatch, RolloutBuffer
+from skat_rl.envs.observations import index_observations, stack_observations
 from skat_rl.envs.skat_python_env import SkatSingleAgentEnv
 from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
@@ -49,14 +50,11 @@ def main():
 
     try:
         if args.env == "cpp":
-            observation_dim = int(envs.observation_space.shape[0])
             action_dim = int(envs.action_space.n)
         else:
-            observation_dim = int(envs[0].observation_space.shape[0])
             action_dim = int(envs[0].action_space.n)
 
         config = PPOConfig(
-            observation_dim=observation_dim,
             action_dim=action_dim,
             architecture=args.architecture,
             use_belief=args.use_belief,
@@ -86,8 +84,8 @@ def main():
         else:
             agent = PPOAgent.load(args.continue_model, device=args.device)
             global_step = 0
-            if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
-                raise ValueError("Checkpoint observation/action dimensions do not match the env.")
+            if agent.config.action_dim != action_dim:
+                raise ValueError("Checkpoint action dimension does not match the env.")
             if args.use_belief and agent.config.architecture != "transformer":
                 raise ValueError("--belief requires a transformer checkpoint.")
             if (
@@ -125,12 +123,11 @@ def _train_python(agent, envs, args, output_dir, global_step):
         observation, _ = env.reset(seed=_env_seed(args.seed, env_index))
         observations.append(observation)
 
-    observations = np.asarray(observations, dtype=np.float32)
+    observations = stack_observations(observations)
     dones = np.zeros(len(envs), dtype=np.float32)
     rollout = RolloutBuffer(
         args.rollout_steps,
         len(envs),
-        agent.config.observation_dim,
         agent.config.action_dim,
         use_belief=agent.config.architecture == "transformer" and agent.config.use_belief,
     )
@@ -211,7 +208,7 @@ def _train_python(agent, envs, args, output_dir, global_step):
                     action_masks,
                     belief_targets,
                 )
-                observations = np.asarray(next_observations, dtype=np.float32)
+                observations = stack_observations(next_observations)
                 dones = next_dones
 
             last_values = agent.get_values(observations)
@@ -330,7 +327,7 @@ def _collect_cpp_batched_rollout(agent, env, global_step, opponent=None):
     while len(state["active_indices"]) > 0:
         active_indices = state["active_indices"]
         learner_rows = np.flatnonzero(state["current_players"] == env.learning_player)
-        observations = state["observations"][learner_rows]
+        observations = index_observations(state["observations"], learner_rows)
         action_masks = state["action_masks"][learner_rows]
         actions = np.empty(len(active_indices), dtype=np.int64)
         if len(learner_rows):
@@ -340,13 +337,13 @@ def _collect_cpp_batched_rollout(agent, env, global_step, opponent=None):
             opponent_rows = np.flatnonzero(state["current_players"] != env.learning_player)
             if len(opponent_rows):
                 actions[opponent_rows], _, _ = opponent.get_action_and_value(
-                    state["observations"][opponent_rows], state["action_masks"][opponent_rows],
+                    index_observations(state["observations"], opponent_rows), state["action_masks"][opponent_rows],
                 )
 
         for batch_index, row_index in enumerate(learner_rows):
             env_index = int(active_indices[row_index])
             trajectory = trajectories[env_index]
-            trajectory["observations"].append(observations[batch_index])
+            trajectory["observations"].append(index_observations(observations, batch_index))
             trajectory["actions"].append(int(actions[row_index]))
             trajectory["log_probs"].append(float(log_probs[batch_index]))
             trajectory["rewards"].append(0.0)
@@ -429,9 +426,8 @@ def _trajectories_to_rollout_batch(trajectories, gamma, gae_lambda):
         )
 
     return RolloutBatch(
-        observations=np.asarray(
-            [observation for batch in batches for observation in batch["observations"]],
-            dtype=np.float32,
+        observations=stack_observations(
+            observation for batch in batches for observation in batch["observations"]
         ),
         actions=np.asarray(
             [action for batch in batches for action in batch["actions"]],
@@ -497,8 +493,8 @@ def initialize_agent(config, init_model=None, device=None):
         return PPOAgent(config, device=device)
     checkpoint = torch.load(init_model, map_location="cpu", weights_only=True)
     saved = checkpoint["config"]
-    if saved["observation_dim"] != config.observation_dim or saved["action_dim"] != config.action_dim:
-        raise ValueError("Checkpoint observation/action dimensions do not match the env.")
+    if saved["action_dim"] != config.action_dim:
+        raise ValueError("Checkpoint action dimension does not match the env.")
     if config.use_belief and not saved.get("use_belief", False):
         raise ValueError("--belief cannot enable belief in an existing checkpoint.")
     architecture_fields = (
