@@ -38,6 +38,7 @@ def test_belief_flag_rejects_no_belief_checkpoint(monkeypatch, tmp_path):
     train_torch_ppo.PPOAgent(config, device="cpu").save(checkpoint)
     monkeypatch.setattr(sys, "argv", [
         "train_torch_ppo", "--belief", "--continue-model", str(checkpoint),
+        "--opponent-model", str(checkpoint),
         "--rollout-size", "1", "--output-dir", str(tmp_path),
     ])
 
@@ -180,6 +181,7 @@ def test_collect_cpp_batched_rollout_collects_complete_games():
         agent,
         env,
         global_step=0,
+        opponent=train_torch_ppo.PPOAgent(config, device="cpu"),
     )
 
     assert global_step == 20
@@ -202,7 +204,7 @@ def test_collect_cpp_batched_rollout_without_belief_skips_targets():
     agent = train_torch_ppo.PPOAgent(config, device="cpu")
 
     rollout, episodes, global_step = train_torch_ppo._collect_cpp_batched_rollout(
-        agent, env, global_step=0,
+        agent, env, global_step=0, opponent=train_torch_ppo.PPOAgent(config, device="cpu"),
     )
 
     assert global_step == 20
@@ -243,7 +245,7 @@ def test_fixed_opponent_collection_batches_policies_and_credits_terminal_reward(
 
     learner, opponent = RecordingPolicy(), RecordingPolicy()
     env = TracedEnv(
-        12, learning_player=learning_player, seed=17, autoplay_opponents=False,
+        12, learning_player=learning_player, seed=17,
     )
     rollout, episodes, steps = train_torch_ppo._collect_cpp_batched_rollout(
         learner, env, 7, opponent,
@@ -330,7 +332,7 @@ def test_frozen_opponent_is_unchanged_by_ppo_training(tmp_path, supervised_check
     assert all(not p.requires_grad for p in opponent.model.parameters())
     before = {name: value.clone() for name, value in opponent.model.state_dict().items()}
     learner_before = {name: value.clone() for name, value in learner.model.state_dict().items()}
-    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(4, autoplay_opponents=False)
+    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(4)
     rollout, episodes, steps = train_torch_ppo._collect_cpp_batched_rollout(
         learner, env, 0, opponent,
     )
@@ -365,6 +367,14 @@ def test_python_env_rejects_neural_opponents(monkeypatch):
     ])
     with pytest.raises(ValueError, match="requires --env cpp"):
         train_torch_ppo.main()
+
+
+def test_cpp_training_requires_neural_opponent_before_creating_run(monkeypatch, tmp_path):
+    output = tmp_path / "runs"
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo", "--env", "cpp", "--output-dir", str(output)])
+    with pytest.raises(ValueError, match="--env cpp requires --opponent-model"):
+        train_torch_ppo.main()
+    assert not output.exists()
 
 
 def test_opponent_checkpoint_rejects_incompatible_dimensions(tmp_path):

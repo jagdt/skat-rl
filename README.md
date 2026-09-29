@@ -65,10 +65,10 @@ Run SB3 Maskable PPO training:
 python -m skat_rl.training.train_sb3_ppo
 ```
 
-Run the from-scratch PyTorch PPO implementation:
+Run the from-scratch PyTorch PPO implementation against Python heuristic opponents:
 
 ```bash
-python -m skat_rl.training.train_torch_ppo
+python -m skat_rl.training.train_torch_ppo --env python
 ```
 
 Plot a native PyTorch PPO run:
@@ -159,7 +159,8 @@ Initialize PPO with pretrained weights:
 
 ```bash
 python -m skat_rl.training.train_torch_ppo \
-  --init-model models/skat_pretrained/best.pt --env cpp --learning-rate 0.0001
+  --init-model models/skat_pretrained/best.pt \
+  --opponent-model models/skat_pretrained/best.pt --env cpp --learning-rate 0.0001
 ```
 
 `--init-model` adopts the checkpoint's architecture and weights, while using fresh
@@ -209,14 +210,16 @@ calibrated win-probability estimate. The existing trump-suit heuristic is retain
 Games remain suit card-play games without bidding or Skat pickup/discard decisions.
 The learning seat stays fixed (`--learning-player`, default 0), but its role changes
 with the deal. `--fixed-declarer 0`, `1`, or `2` instead filters deals until that
-seat is selected. Without `--opponent-model`, heuristic card-play opponents are
-used, with the same heuristic declarer selection. `--fixed-declarer -1` remains
+seat is selected. C++ training requires `--opponent-model`: every card is chosen
+by the learner or the frozen neural opponent. To train against heuristic card-play
+opponents, use `--env python`. Deal setup (declarer and trump-suit selection) is
+unchanged in both engines. `--fixed-declarer -1` remains
 an explicit alias for the default heuristic selection.
 
 
 ### Batched Turn Interface
 
-`SkatCppBatchedSingleAgentEnv(..., autoplay_opponents=False)` exposes every turn:
+`SkatCppBatchedSingleAgentEnv(...)` always exposes every turn:
 
 - `reset()` deals games without autoplaying any cards.
 - State arrays contain `active_indices`, `current_players`, `declarers`,
@@ -235,7 +238,8 @@ The collector groups current-player observations by learner/frozen policy, perfo
 at most one forward pass per nonempty policy group, and submits a single combined
 action batch. Different games may have different players to act. Python performs
 trajectory bookkeeping but does not loop over individual games to step the engine.
-The default `autoplay_opponents=True` preserves the heuristic-opponent interface.
+There is no C++ autoplay option or built-in opponent policy. Only the Python
+environment retains heuristic opponents and advances their turns automatically.
 
 After changing C++ sources, rebuild the extension before running:
 

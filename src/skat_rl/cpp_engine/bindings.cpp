@@ -246,11 +246,10 @@ PYBIND11_MODULE(_skat_cpp, m) {
 
     py::class_<skat_rl::BatchedFastSkatEnv>(m, "BatchedFastSkatEnv")
         .def(
-            py::init<int, int, int, bool>(),
+            py::init<int, int, int>(),
             py::arg("size"),
             py::arg("learning_player"),
-            py::arg("fixed_declarer") = -1,
-            py::arg("autoplay_opponents") = true
+            py::arg("fixed_declarer") = -1
         )
         .def(
             "reset",

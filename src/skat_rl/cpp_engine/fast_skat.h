@@ -144,8 +144,7 @@ struct BatchedStepInfo {
 
 class BatchedFastSkatEnv {
 public:
-    BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer = -1,
-                       bool autoplay_opponents = true);
+    BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer = -1);
 
     void reset(uint64_t seed);
     void reset_many(const std::vector<uint64_t>& seeds);
@@ -164,24 +163,10 @@ public:
 private:
     std::vector<FastSkatGame> games_;
     std::vector<uint8_t> active_;
-    std::vector<float> episode_returns_;
     std::vector<int> episode_lengths_;
     int learning_player_ = 0;
     int fixed_declarer_ = -1;
-    bool autoplay_opponents_ = true;
-
-    float play_until_learning_player(FastSkatGame& game);
     float reward_for_step(const FastSkatGame& game, const StepInfo& info) const;
-    int choose_opponent_action(const FastSkatGame& game) const;
-    int choose_leading_action(const FastSkatGame& game, const std::vector<int>& legal) const;
-    int choose_following_action(const FastSkatGame& game, const std::vector<int>& legal) const;
-    std::vector<int> winning_cards(const FastSkatGame& game, const std::vector<int>& legal) const;
-    int current_winning_player(const FastSkatGame& game) const;
-    int trick_value(const FastSkatGame& game) const;
-    int lowest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const;
-    int highest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const;
-    int lowest_winner(const std::vector<int>& cards, int game_kind, int trump_suit) const;
-    int trump_strength(int card, int game_kind, int trump_suit) const;
 };
 
 }  // namespace skat_rl

@@ -22,6 +22,8 @@ def main():
     if args.opponent_model is not None and args.env != "cpp":
         raise ValueError("--opponent-model requires --env cpp.")
     if args.env == "cpp":
+        if args.opponent_model is None:
+            raise ValueError("--env cpp requires --opponent-model. Use --env python for heuristic opponents.")
         if args.rollout_size < 1:
             raise ValueError("--rollout-size must be at least 1")
     else:
@@ -40,7 +42,6 @@ def main():
             learning_player=args.learning_player,
             fixed_declarer=args.fixed_declarer,
             seed=args.seed,
-            autoplay_opponents=args.opponent_model is None,
         )
     else:
         envs = [
@@ -95,11 +96,9 @@ def main():
             ):
                 raise ValueError("--belief cannot enable belief in an existing checkpoint.")
 
-        opponent = None
-        if args.opponent_model is not None:
-            opponent = load_frozen_opponent(args.opponent_model, agent.config, agent.device)
         _save_config(output_dir, args, agent.config)
         if args.env == "cpp":
+            opponent = load_frozen_opponent(args.opponent_model, agent.config, agent.device)
             _train_cpp_batched(agent, envs, args, output_dir, global_step, opponent)
         else:
             _train_python(agent, envs, args, output_dir, global_step)
@@ -247,7 +246,7 @@ def _train_python(agent, envs, args, output_dir, global_step):
     _save_episode_history(output_dir, completed_episodes)
 
 
-def _train_cpp_batched(agent, env, args, output_dir, global_step, opponent=None):
+def _train_cpp_batched(agent, env, args, output_dir, global_step, opponent):
     completed_episodes = []
     update = 0
     metrics_path = output_dir / "metrics.csv"
@@ -313,9 +312,7 @@ def _train_cpp_batched(agent, env, args, output_dir, global_step, opponent=None)
     _save_episode_history(output_dir, completed_episodes)
 
 
-def _collect_cpp_batched_rollout(agent, env, global_step, opponent=None):
-    if env.autoplay_opponents != (opponent is None):
-        raise ValueError("External-turn mode requires a frozen opponent; autoplay does not.")
+def _collect_cpp_batched_rollout(agent, env, global_step, opponent):
     state = env.reset()
     use_belief = agent.config.architecture == "transformer" and agent.config.use_belief
     trajectories = {
@@ -333,12 +330,11 @@ def _collect_cpp_batched_rollout(agent, env, global_step, opponent=None):
         if len(learner_rows):
             learner_actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
             actions[learner_rows] = learner_actions
-        if opponent is not None:
-            opponent_rows = np.flatnonzero(state["current_players"] != env.learning_player)
-            if len(opponent_rows):
-                actions[opponent_rows], _, _ = opponent.get_action_and_value(
-                    index_observations(state["observations"], opponent_rows), state["action_masks"][opponent_rows],
-                )
+        opponent_rows = np.flatnonzero(state["current_players"] != env.learning_player)
+        if len(opponent_rows):
+            actions[opponent_rows], _, _ = opponent.get_action_and_value(
+                index_observations(state["observations"], opponent_rows), state["action_masks"][opponent_rows],
+            )
 
         for batch_index, row_index in enumerate(learner_rows):
             env_index = int(active_indices[row_index])
@@ -532,7 +528,7 @@ def _parse_args():
     checkpoint.add_argument("--continue-model")
     checkpoint.add_argument("--init-model", help="Initialize model weights with fresh PPO hyperparameters/optimizer.")
     parser.add_argument("--opponent-model",
-                        help="Frozen checkpoint controlling both other seats (C++ only).")
+                        help="Frozen checkpoint controlling both other seats (required for --env cpp).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--architecture", choices=["mlp", "transformer"], default="transformer")
     parser.add_argument("--belief", dest="use_belief", action="store_true",

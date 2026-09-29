@@ -1,9 +1,7 @@
 #include "fast_skat.h"
 
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
-#include <utility>
 
 namespace skat_rl {
 
@@ -648,15 +646,12 @@ int FastSkatGame::final_game_value() const {
     return base * (matadors + 1 + int(hand_game_) + int(schneider) + int(schwarz));
 }
 
-BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer,
-                                     bool autoplay_opponents)
+BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer)
     : games_(size),
       active_(size, 0),
-      episode_returns_(size, 0.0F),
       episode_lengths_(size, 0),
       learning_player_(learning_player),
-      fixed_declarer_(fixed_declarer),
-      autoplay_opponents_(autoplay_opponents) {
+      fixed_declarer_(fixed_declarer) {
     if (size < 1) {
         throw std::invalid_argument("BatchedFastSkatEnv size must be at least 1.");
     }
@@ -687,14 +682,7 @@ void BatchedFastSkatEnv::reset_many(const std::vector<uint64_t>& seeds) {
             games_[index].reset_fixed_declarer(seeds[index], fixed_declarer_);
         }
         active_[index] = 1;
-        episode_returns_[index] = 0.0F;
         episode_lengths_[index] = 0;
-        if (autoplay_opponents_) {
-            play_until_learning_player(games_[index]);
-        }
-        if (games_[index].is_terminal()) {
-            active_[index] = 0;
-        }
     }
 }
 
@@ -726,18 +714,10 @@ BatchedStepInfo BatchedFastSkatEnv::step(const std::vector<int>& actions) {
         if (game.is_terminal()) {
             throw std::runtime_error("Cannot step a terminated active environment.");
         }
-        if (autoplay_opponents_ && game.current_player() != learning_player_) {
-            throw std::runtime_error("Active environment is not at the learning player's turn.");
-        }
-
         const bool learner_acted = game.current_player() == learning_player_;
         StepInfo step_info = game.step(actions[batch_index]);
-        float reward = reward_for_step(game, step_info);
-        if (autoplay_opponents_ && !game.is_terminal()) {
-            reward += play_until_learning_player(game);
-        }
+        const float reward = reward_for_step(game, step_info);
 
-        episode_returns_[env_index] += reward;
         episode_lengths_[env_index] += learner_acted ? 1 : 0;
 
         const bool done = game.is_terminal();
@@ -747,7 +727,7 @@ BatchedStepInfo BatchedFastSkatEnv::step(const std::vector<int>& actions) {
         if (done) {
             active_[env_index] = 0;
             result.completed_env_indices.push_back(env_index);
-            result.completed_returns.push_back(episode_returns_[env_index]);
+            result.completed_returns.push_back(reward);
             result.completed_lengths.push_back(episode_lengths_[env_index]);
         }
     }
@@ -833,16 +813,6 @@ int BatchedFastSkatEnv::action_dim() const {
     return kNumCards;
 }
 
-float BatchedFastSkatEnv::play_until_learning_player(FastSkatGame& game) {
-    float total_reward = 0.0F;
-    while (!game.is_terminal() && game.current_player() != learning_player_) {
-        const int action = choose_opponent_action(game);
-        const StepInfo step_info = game.step(action);
-        total_reward += reward_for_step(game, step_info);
-    }
-    return total_reward;
-}
-
 float BatchedFastSkatEnv::reward_for_step(const FastSkatGame& game, const StepInfo& info) const {
     if (!info.terminated) {
         return 0.0F;
@@ -854,174 +824,6 @@ float BatchedFastSkatEnv::reward_for_step(const FastSkatGame& game, const StepIn
         return static_cast<float>(declarer_won ? info.game_value + 50 : -2 * info.game_value - 50) / 100.0F;
     }
     return declarer_won ? 0.0F : 0.4F;
-}
-
-int BatchedFastSkatEnv::choose_opponent_action(const FastSkatGame& game) const {
-    const std::vector<int> legal = game.legal_actions();
-    if (legal.empty()) {
-        throw std::runtime_error("No legal opponent actions available.");
-    }
-
-    if (game.trick_position() == 0) {
-        return choose_leading_action(game, legal);
-    }
-    return choose_following_action(game, legal);
-}
-
-int BatchedFastSkatEnv::choose_leading_action(const FastSkatGame& game, const std::vector<int>& legal) const {
-    const int player = game.current_player();
-    const int game_kind = game.game_kind();
-    const int trump_suit = game.trump_suit();
-
-    if (player == game.declarer()) {
-        std::vector<int> trumps;
-        for (int card : legal) {
-            if (is_trump(card, game_kind, trump_suit)) {
-                trumps.push_back(card);
-            }
-        }
-        if (!trumps.empty()) {
-            return *std::max_element(trumps.begin(), trumps.end(), [&](int lhs, int rhs) {
-                return trump_strength(lhs, game_kind, trump_suit) < trump_strength(rhs, game_kind, trump_suit);
-            });
-        }
-    }
-
-    std::vector<int> non_trumps;
-    for (int card : legal) {
-        if (!is_trump(card, game_kind, trump_suit)) {
-            non_trumps.push_back(card);
-        }
-    }
-    if (!non_trumps.empty()) {
-        return lowest_discard(non_trumps, game_kind, trump_suit);
-    }
-    return lowest_discard(legal, game_kind, trump_suit);
-}
-
-int BatchedFastSkatEnv::choose_following_action(const FastSkatGame& game, const std::vector<int>& legal) const {
-    const int player = game.current_player();
-    const int game_kind = game.game_kind();
-    const int trump_suit = game.trump_suit();
-    const std::vector<int> winners = winning_cards(game, legal);
-
-    if (player == game.declarer()) {
-        std::vector<int> non_trump_winners;
-        for (int card : winners) {
-            if (!is_trump(card, game_kind, trump_suit)) {
-                non_trump_winners.push_back(card);
-            }
-        }
-        if (!non_trump_winners.empty()) {
-            return lowest_winner(non_trump_winners, game_kind, trump_suit);
-        }
-        if (!winners.empty() && trick_value(game) >= 9) {
-            return lowest_winner(winners, game_kind, trump_suit);
-        }
-        return lowest_discard(legal, game_kind, trump_suit);
-    }
-
-    if (current_winning_player(game) != game.declarer()) {
-        return highest_discard(legal, game_kind, trump_suit);
-    }
-    if (!winners.empty()) {
-        return lowest_winner(winners, game_kind, trump_suit);
-    }
-    return lowest_discard(legal, game_kind, trump_suit);
-}
-
-std::vector<int> BatchedFastSkatEnv::winning_cards(const FastSkatGame& game, const std::vector<int>& legal) const {
-    std::vector<int> winners;
-    const std::vector<int> cards = game.current_trick_cards();
-    if (cards.empty()) {
-        return winners;
-    }
-
-    const int lead_card = cards[0];
-    int best_strength = std::numeric_limits<int>::min();
-    for (int card : cards) {
-        best_strength = std::max(
-            best_strength,
-            card_strength_in_trick(card, lead_card, game.game_kind(), game.trump_suit())
-        );
-    }
-
-    for (int card : legal) {
-        const int strength = card_strength_in_trick(card, lead_card, game.game_kind(), game.trump_suit());
-        if (strength > best_strength) {
-            winners.push_back(card);
-        }
-    }
-    return winners;
-}
-
-int BatchedFastSkatEnv::current_winning_player(const FastSkatGame& game) const {
-    const std::vector<int> cards = game.current_trick_cards();
-    const std::vector<int> players = game.current_trick_players();
-    if (cards.empty()) {
-        return game.current_player();
-    }
-
-    const int lead_card = cards[0];
-    int best_player = players[0];
-    int best_strength = card_strength_in_trick(cards[0], lead_card, game.game_kind(), game.trump_suit());
-
-    for (std::size_t index = 1; index < cards.size(); ++index) {
-        const int strength = card_strength_in_trick(cards[index], lead_card, game.game_kind(), game.trump_suit());
-        if (strength > best_strength) {
-            best_strength = strength;
-            best_player = players[index];
-        }
-    }
-    return best_player;
-}
-
-int BatchedFastSkatEnv::trick_value(const FastSkatGame& game) const {
-    int value = 0;
-    for (int card : game.current_trick_cards()) {
-        value += card_points(card);
-    }
-    return value;
-}
-
-int BatchedFastSkatEnv::lowest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const {
-    return *std::min_element(cards.begin(), cards.end(), [&](int lhs, int rhs) {
-        return std::make_pair(card_points(lhs), trump_strength(lhs, game_kind, trump_suit))
-            < std::make_pair(card_points(rhs), trump_strength(rhs, game_kind, trump_suit));
-    });
-}
-
-int BatchedFastSkatEnv::highest_discard(const std::vector<int>& cards, int game_kind, int trump_suit) const {
-    return *std::max_element(cards.begin(), cards.end(), [&](int lhs, int rhs) {
-        return std::make_pair(card_points(lhs), trump_strength(lhs, game_kind, trump_suit))
-            < std::make_pair(card_points(rhs), trump_strength(rhs, game_kind, trump_suit));
-    });
-}
-
-int BatchedFastSkatEnv::lowest_winner(const std::vector<int>& cards, int game_kind, int trump_suit) const {
-    return lowest_discard(cards, game_kind, trump_suit);
-}
-
-int BatchedFastSkatEnv::trump_strength(int card, int game_kind, int trump_suit) const {
-    if (!is_trump(card, game_kind, trump_suit)) {
-        return 0;
-    }
-
-    const int rank = card_rank(card);
-    if (rank == 7) {
-        return 100 - card_suit(card);
-    }
-
-    switch (rank) {
-        case 6: return 70; // ace
-        case 5: return 60; // ten
-        case 4: return 50; // king
-        case 3: return 40; // queen
-        case 2: return 30; // nine
-        case 1: return 20; // eight
-        case 0: return 10; // seven
-        default: return 0;
-    }
 }
 
 }  // namespace skat_rl

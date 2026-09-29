@@ -7,10 +7,11 @@ from skat_rl.envs.observations import CardStatus, OBSERVATION_SPECS, index_obser
 from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 
-def test_cpp_batched_env_reset_shapes_and_masks():
+@pytest.mark.parametrize("learning_player", [0, 1, 2])
+def test_cpp_batched_env_reset_shapes_and_masks(learning_player):
     env = SkatCppBatchedSingleAgentEnv(
         rollout_size=4,
-        learning_player=0,
+        learning_player=learning_player,
         fixed_declarer=0,
         seed=1,
     )
@@ -18,6 +19,9 @@ def test_cpp_batched_env_reset_shapes_and_masks():
     state = env.reset(seed=1)
 
     assert state["active_indices"].tolist() == [0, 1, 2, 3]
+    assert state["current_players"].tolist() == [0] * 4
+    assert np.all(np.sum(state["observations"]["card_status"] == CardStatus.OWN, axis=1) == 10)
+    assert not np.any(state["observations"]["card_status"] == CardStatus.PLAYED)
     for name, (shape, _, _) in OBSERVATION_SPECS.items():
         assert state["observations"][name].shape == (4,) + shape
         assert state["observations"][name].dtype == np.int8
@@ -70,7 +74,7 @@ def test_cpp_batched_env_steps_all_active_games_until_done():
             "belief_targets": result["belief_targets"],
         }
 
-    assert total_steps == 30
+    assert total_steps == 90  # All 30 cards per game are supplied explicitly.
     assert completed_lengths == [10, 10, 10]
     assert len(completed_returns) == 3
 
@@ -79,7 +83,6 @@ def test_cpp_batched_env_steps_all_active_games_until_done():
 def test_external_turns_match_individual_games_for_every_player(learning_player):
     env = SkatCppBatchedSingleAgentEnv(
         rollout_size=12, learning_player=learning_player, seed=17,
-        autoplay_opponents=False,
     )
     games = []
     for seed in env._env_seeds(17):
@@ -140,9 +143,8 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
     assert_observations_equal(reset["observations"], env.reset(seed=17)["observations"])
 
 
-@pytest.mark.parametrize("autoplay", [True, False])
-def test_invalid_batch_does_not_partially_step_games(autoplay):
-    env = SkatCppBatchedSingleAgentEnv(3, autoplay_opponents=autoplay)
+def test_invalid_batch_does_not_partially_step_games():
+    env = SkatCppBatchedSingleAgentEnv(3)
     state = env.reset(seed=42)
     actions = state["action_masks"].argmax(axis=1)
     actions[-1] = np.flatnonzero(~state["action_masks"][-1])[0]
@@ -165,3 +167,17 @@ def assert_observations_equal(actual, expected):
     assert actual.keys() == expected.keys()
     for name in actual:
         np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
+
+
+@pytest.mark.parametrize("learning_player", [0, 1, 2])
+def test_step_plays_exactly_one_card_regardless_of_learning_seat(learning_player):
+    env = SkatCppBatchedSingleAgentEnv(4, learning_player=learning_player)
+    state = env.reset(seed=42)
+    for played in range(1, 4):
+        state = env.step(state["action_masks"].argmax(axis=1))
+        counts = np.sum(state["observations"]["card_status"] == CardStatus.PLAYED, axis=1)
+        np.testing.assert_array_equal(counts, [played] * 4)
+        assert not state["terminated"].any()
+        np.testing.assert_array_equal(state["rewards"], np.zeros(4))
+        if played < 3:
+            assert state["current_players"].tolist() == [played] * 4

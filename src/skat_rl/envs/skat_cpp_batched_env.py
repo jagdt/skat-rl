@@ -7,35 +7,27 @@ from skat_rl.envs.observations import observation_space
 
 class SkatCppBatchedSingleAgentEnv:
     """
-    Batched C++ single-agent Skat environment for PPO rollout collection.
+    Batched C++ Skat environment for neural-network self-play.
 
     The batch owns `rollout_size` independent C++ games. A reset starts one
-    game per slot and autoplays opponents until the learning player's first
-    decision. Each `step(actions)` consumes one action for every active game,
-    then autoplays opponents in C++ until each active game is either terminal
-    or back at the learning player's turn.
-
-    With `autoplay_opponents=False`, reset does not play any cards and step
-    plays exactly one card per active game. Observations, masks and belief
+    game per slot without playing any cards. Each `step(actions)` plays
+    exactly one supplied card per active game. Observations, masks and belief
     targets belong to `current_players`, which can differ across games.
     Rewards always belong to `learning_player`; episode lengths count only
     that player's decisions. The caller supplies actions for all seats.
     """
 
-    def __init__(self, rollout_size, learning_player=0, fixed_declarer=None, seed=42,
-                 autoplay_opponents=True):
+    def __init__(self, rollout_size, learning_player=0, fixed_declarer=None, seed=42):
         self.rollout_size = int(rollout_size)
         self.learning_player = int(learning_player)
         self.fixed_declarer = -1 if fixed_declarer is None else int(fixed_declarer)
         self.seed_value = None if seed is None else int(seed)
-        self.autoplay_opponents = bool(autoplay_opponents)
         if self.rollout_size < 1:
             raise ValueError("rollout_size must be at least 1.")
         self.game = BatchedFastSkatEnv(
             self.rollout_size,
             self.learning_player,
             self.fixed_declarer,
-            self.autoplay_opponents,
         )
         self.observation_space = observation_space()
         self.action_space = spaces.Discrete(self.game.action_dim())
