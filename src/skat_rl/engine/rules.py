@@ -137,7 +137,7 @@ def points_won_by_player(won_cards, player):
     return sum(card_points(card) for card in won_cards[player])
 
 
-def game_result(won_cards, trick_winners, declarer, game_type):
+def game_result(won_cards, trick_winners, declarer, game_type, skat):
     if game_type.kind == GameKind.NULL:
         declarer_won = not declarer_took_trick(trick_winners, declarer)
 
@@ -150,17 +150,19 @@ def game_result(won_cards, trick_winners, declarer, game_type):
             "schwarz": declarer_won,
         }
 
-    dec_points = points_won_by_player(won_cards, declarer)
+    dec_points = points_won_by_player(won_cards, declarer) + sum(
+        card_points(card) for card in skat
+    )
     def_points = 120 - dec_points
 
     declarer_won = dec_points > 60
 
     if declarer_won:
         schneider = def_points <= 30
-        schwarz = def_points == 0
+        schwarz = all(winner == declarer for winner in trick_winners)
     else:
         schneider = dec_points <= 30
-        schwarz = dec_points == 0
+        schwarz = not declarer_took_trick(trick_winners, declarer)
 
     return {
         "declarer": declarer,

@@ -3,6 +3,7 @@ import random
 from .cards import full_deck, card_rank, card_suit, Rank, Suit
 from .rules import game_result, legal_moves, trick_points, trick_winner
 from .state import GameKind, GameState, GameType, Trick
+from .scoring import game_value, tournament_rewards
 
 
 class StepResult:
@@ -14,36 +15,48 @@ class StepResult:
 
 
 class SkatGame:
-    def __init__(self, game_type=None, declarer=0, seed=None):
+    def __init__(self, game_type=None, declarer=0, fixed_declarer=None, seed=None):
+        if fixed_declarer is not None and fixed_declarer not in range(3):
+            raise ValueError("fixed_declarer must be 0, 1, 2, or None.")
+
         self.rng = random.Random(seed)
         self.default_game_type = game_type or GameType(GameKind.GRAND)
         self.default_declarer = declarer
+        self.fixed_declarer = fixed_declarer
         self.state = None
 
     def reset(self, game_type=None, declarer=None, seed=None):
         if seed is not None:
             self.rng.seed(seed)
 
-        deck = full_deck()
-        self.rng.shuffle(deck)
+        while True:
+            deck = full_deck()
+            self.rng.shuffle(deck)
 
-        hands = [
-            set(deck[0:10]),
-            set(deck[10:20]),
-            set(deck[20:30]),
-        ]
+            hands = [
+                set(deck[0:10]),
+                set(deck[10:20]),
+                set(deck[20:30]),
+            ]
+
+            if (
+                declarer is not None
+                or self.fixed_declarer is None
+                or self._choose_declarer(hands) == self.fixed_declarer
+            ):
+                break
 
         skat = deck[30:32]
 
         if declarer is None:
-            declarer = self._choose_declarer(hands)
+            if self.fixed_declarer is not None:
+                declarer = self.fixed_declarer
+            else:
+                declarer = self._choose_declarer(hands)
 
         if game_type is None:
             trump_suit = self._choose_trump_suit(hands[declarer])
-            game_type = GameType(GameKind.SUIT, trump_suit=trump_suit)
-
-        if declarer is None:
-            declarer = self.default_declarer
+            game_type = GameType(GameKind.SUIT, trump_suit=trump_suit, hand=True)
 
         if game_type is None:
             game_type = self.default_game_type
@@ -129,8 +142,17 @@ class SkatGame:
                     trick_winners=self.state.trick_winners,
                     declarer=self.state.declarer,
                     game_type=self.state.game_type,
+                    skat=self.state.skat,
                 )
 
+                declarer_cards = set(self.state.skat)
+                declarer_cards.update(
+                    card for trick in self.state.completed_tricks
+                    for player, card in trick.cards if player == self.state.declarer
+                )
+                result["game_value"] = game_value(
+                    self.state.game_type, declarer_cards, result["schneider"], result["schwarz"],
+                )
                 info["result"] = result
                 reward = self._terminal_reward(result)
 
@@ -198,22 +220,7 @@ class SkatGame:
         return best_suit
 
     def _terminal_reward(self, result):
-        declarer = result["declarer"]
-        declarer_won = result["declarer_won"]
-        declarer_points = result["declarer_points"]
-
-        reward = [0.0, 0.0, 0.0]
-
-        if declarer_won:
-            reward[declarer] = 1.0 + 0.2 * (declarer_points - 60) / 60.0
-        else:
-            reward[declarer] = -1.0 - 0.2 * (60 - declarer_points) / 60.0
-
-        for player in range(3):
-            if player != declarer:
-                reward[player] = -reward[declarer] / 2.0
-
-        return reward
+        return tournament_rewards(result["declarer"], result["declarer_won"], result["game_value"])
 
     def _require_state(self):
         if self.state is None:

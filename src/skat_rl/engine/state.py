@@ -12,6 +12,7 @@ class GameKind(str, Enum):
 class GameType:
     kind: GameKind
     trump_suit: object = None
+    hand: bool = False
 
 
 @dataclass
