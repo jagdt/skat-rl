@@ -186,12 +186,15 @@ def test_effective_suit_lookup_uses_engine_rules_for_every_card_and_contract():
 
 def test_empty_batches_keep_field_shapes_and_compact_integer_storage():
     batch = stack_observations([])
+    assert "winning_bid" not in OBSERVATION_SPECS
+    assert "winning_bid" not in batch
     for field, (shape, _, _) in OBSERVATION_SPECS.items():
         assert batch[field].shape == (0,) + shape
         assert batch[field].dtype == np.int16
     game = SkatGame()
     obs = build_observation(game.reset(seed=1), 0)
-    assert sum(value.nbytes for value in obs.values()) == 340
+    assert "winning_bid" not in obs
+    assert sum(value.nbytes for value in obs.values()) == 338
     batch = stack_observations([obs, obs])
     assert_equal(index_observations(batch, 1), obs)
     assert_equal(index_observations(batch, np.array([1, 0])), batch)

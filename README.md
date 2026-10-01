@@ -37,7 +37,6 @@ scalar globals and 32-element card arrays; batching adds a leading dimension `B`
 | `seat` | `[B]` | Forehand, middlehand, rearhand: `0..2` |
 | `auction_role` | `[B]` | Caller `0`, holder `1`; `-1` outside bidding |
 | `decision_threshold` | `[B]` | Actual bid amount currently being decided; otherwise `-1` |
-| `winning_bid` | `[B]` | Committed auction amount, initially `0` |
 | `hand_game` | `[B]` | Unknown `-1`, pickup `0`, Hand `1` |
 | `bid_status` | `[B, 3]` | SELF/LEFT/RIGHT: not entered `0`, active `1`, passed `2` |
 | `highest_called`, `highest_held` | `[B, 3]` each | Separate actual bid amounts, absent `-1` |
@@ -164,7 +163,7 @@ duplicate record IDs and duplicate initial deals are removed across all inputs u
 an on-disk SQLite index. This prevents the same game/deal from appearing on both
 sides. Output directories must not already exist. Memory is bounded by shard size,
 although each training worker decompresses its own shard. The default 32768-row
-shard has about 11.1 MB of observation array data before compression (170 int16
+shard has about 11.1 MB of observation array data before compression (169 int16
 values per example), excluding labels and Python/NumPy object overhead.
 
 Train the policy with legal-action-masked cross-entropy and the value head with

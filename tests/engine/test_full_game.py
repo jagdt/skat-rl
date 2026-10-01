@@ -57,6 +57,7 @@ def assert_equal(python, cpp):
     for player in range(3):
         assert set(cpp.hand(player)) == state.hands[player]
         expected = build_observation(state, player)
+        assert "winning_bid" not in expected
         assert observation_space().contains(expected)
         actual = cpp.observation(player)
         assert actual.keys() == expected.keys()

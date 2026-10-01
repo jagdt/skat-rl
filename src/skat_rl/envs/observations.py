@@ -59,7 +59,6 @@ class StructuredSkatObservation(TypedDict):
     seat: np.ndarray
     auction_role: np.ndarray
     decision_threshold: np.ndarray
-    winning_bid: np.ndarray
     hand_game: np.ndarray
     bid_status: np.ndarray
     highest_called: np.ndarray
@@ -85,7 +84,6 @@ OBSERVATION_SPECS = {
     "seat": ((), 0, len(Seat) - 1),
     "auction_role": ((), -1, len(AuctionRole) - 1),
     "decision_threshold": ((), -1, max(BID_VALUES)),
-    "winning_bid": ((), 0, max(BID_VALUES)),
     "hand_game": ((), -1, 1),
     "bid_status": ((NUM_PLAYERS,), 0, len(BiddingStatus) - 1),
     "highest_called": ((NUM_PLAYERS,), -1, max(BID_VALUES)),
@@ -181,7 +179,6 @@ def build_observation(state, acting_player, void_info=None) -> StructuredSkatObs
         "seat": (acting_player - state.forehand) % NUM_PLAYERS,
         "auction_role": state.auction_role if state.phase == Phase.BIDDING else -1,
         "decision_threshold": BID_VALUES[state.bid_index] if state.phase == Phase.BIDDING else -1,
-        "winning_bid": state.winning_bid,
         "hand_game": state.hand_game,
     }
     obs.update({key: np.asarray(value, dtype=OBSERVATION_DTYPE) for key, value in scalars.items()})

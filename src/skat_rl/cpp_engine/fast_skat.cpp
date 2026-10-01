@@ -412,7 +412,6 @@ StructuredObservation FastSkatGame::build_observation(int player) const {
     obs.seat = (player - forehand_ + kNumPlayers) % kNumPlayers;
     obs.auction_role = phase_ == BIDDING ? auction_role_ : -1;
     obs.decision_threshold = decision_threshold();
-    obs.winning_bid = winning_bid_;
     obs.hand_game = (phase_ == BIDDING || phase_ == PICKUP_DECISION || declarer_ < 0) ? -1 : int(hand_game_);
     for (int relative = 0; relative < kNumPlayers; ++relative) {
         const int absolute = (player + relative) % kNumPlayers;

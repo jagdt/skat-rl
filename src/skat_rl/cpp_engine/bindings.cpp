@@ -115,7 +115,6 @@ py::dict observation_dict(const std::vector<skat_rl::StructuredObservation>& obs
     result["seat"] = observation_field(observations, &Observation::seat, {}, batched);
     result["auction_role"] = observation_field(observations, &Observation::auction_role, {}, batched);
     result["decision_threshold"] = observation_field(observations, &Observation::decision_threshold, {}, batched);
-    result["winning_bid"] = observation_field(observations, &Observation::winning_bid, {}, batched);
     result["hand_game"] = observation_field(observations, &Observation::hand_game, {}, batched);
     result["bid_status"] = observation_field(observations, &Observation::bid_status, {3}, batched);
     result["highest_called"] = observation_field(observations, &Observation::highest_called, {3}, batched);

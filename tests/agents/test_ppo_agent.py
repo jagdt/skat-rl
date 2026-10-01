@@ -234,6 +234,18 @@ def test_tokenizer_ignores_unplayed_card_metadata():
     torch.testing.assert_close(expected, tokenizer(observations))
 
 
+def test_state_token_still_projects_current_bidding_threshold():
+    tokenizer = SkatObservationTokenizer(model_dim=16)
+    observations = empty_observations((2,))
+    observations["phase"][:] = Phase.BIDDING
+    observations["decision_threshold"][:] = [18, 22]
+    tensors = observation_to_tensors(observations, "cpu")
+    state = tokenizer.tokenize_state(tensors)
+    features = tokenizer.bid_feature(tensors["decision_threshold"], tokenizer.decision_projection)
+    torch.testing.assert_close(state[1] - state[0], features[1] - features[0])
+    assert not torch.allclose(state[0], state[1])
+
+
 def test_tokenizer_projects_trick_index_and_numeric_state_with_documented_scale():
     tokenizer = SkatObservationTokenizer(model_dim=16)
     observations = empty_observations((2,))

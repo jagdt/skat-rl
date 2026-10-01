@@ -54,7 +54,6 @@ struct StructuredObservation {
     int16_t seat = 0;
     int16_t auction_role = -1;
     int16_t decision_threshold = -1;
-    int16_t winning_bid = 0;
     int16_t hand_game = -1;
     std::array<int16_t, kNumPlayers> bid_status{};
     std::array<int16_t, kNumPlayers> highest_called{};

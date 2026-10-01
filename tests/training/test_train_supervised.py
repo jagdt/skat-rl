@@ -174,6 +174,7 @@ def test_compressed_input_deduplication_and_truncated_tail(tmp_path):
 
 def test_shards_exclude_weak_players_and_keep_games_in_one_split(prepared):
     directory, manifest = prepared
+    assert "winning_bid" not in manifest["observation_fields"]
     identities = {}
     for split in ("train", "validation"):
         identities[split] = set()
@@ -188,6 +189,7 @@ def test_shards_exclude_weak_players_and_keep_games_in_one_split(prepared):
                 known = data["obs_relative_declarer"] >= 0
                 assert np.all(teachers[known] != 1)  # Bob is below 1000.
                 assert "observations" not in data
+                assert "obs_winning_bid" not in data
                 for name, (shape, _, _) in OBSERVATION_SPECS.items():
                     assert data[f"obs_{name}"].shape == (len(data["actions"]),) + shape
                     assert data[f"obs_{name}"].dtype == np.int16

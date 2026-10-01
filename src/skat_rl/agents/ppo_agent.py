@@ -174,7 +174,6 @@ class SkatObservationTokenizer(nn.Module):
             + self.contract_embedding(contract.clamp_min(0)) * (contract >= 0).unsqueeze(-1)
             + self.declarer_projection(self.player_embedding(declarer.clamp_min(0))) * (declarer >= 0).unsqueeze(-1)
             + self.hand_embedding(hand_game.clamp_min(0)) * (hand_game >= 0).unsqueeze(-1)
-            + self.bid_feature(observation["winning_bid"], self.decision_projection) * (~bidding).unsqueeze(-1)
         )
         bidding_features = (
             self.seat_embedding(observation["seat"])
