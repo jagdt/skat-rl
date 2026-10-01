@@ -10,24 +10,26 @@ class SkatCppBatchedSingleAgentEnv:
     Batched C++ Skat environment for neural-network self-play.
 
     The batch owns `rollout_size` independent C++ games. A reset starts one
-    game per slot without playing any cards. Each `step(actions)` plays
-    exactly one supplied card per active game. Observations, masks and belief
+    game per slot without taking any actions. Each `step(actions)` processes
+    exactly one supplied action per active game. Observations, masks and belief
     targets belong to `current_players`, which can differ across games.
     Rewards always belong to `learning_player`; episode lengths count only
     that player's decisions. The caller supplies actions for all seats.
     """
 
-    def __init__(self, rollout_size, learning_player=0, fixed_declarer=None, seed=42):
+    def __init__(self, rollout_size, learning_player=0, fixed_declarer=None, seed=42, full_game=False):
         self.rollout_size = int(rollout_size)
         self.learning_player = int(learning_player)
         self.fixed_declarer = -1 if fixed_declarer is None else int(fixed_declarer)
         self.seed_value = None if seed is None else int(seed)
+        self.full_game = full_game
         if self.rollout_size < 1:
             raise ValueError("rollout_size must be at least 1.")
         self.game = BatchedFastSkatEnv(
             self.rollout_size,
             self.learning_player,
             self.fixed_declarer,
+            full_game,
         )
         self.observation_space = observation_space()
         self.action_space = spaces.Discrete(self.game.action_dim())

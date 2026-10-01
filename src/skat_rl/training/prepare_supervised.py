@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 
 import numpy as np
+from skat_rl.engine.actions import NUM_ACTIONS
 
 from skat_rl.envs.observations import (
     DATASET_FORMAT_VERSION, OBSERVATION_SPECS, stack_observations,
@@ -104,7 +105,7 @@ def prepare_dataset(args):
                             prior_games[(properties["PC"], name)] += 1
                         if not any(eligible):
                             raise RecordError("no_eligible_player")
-                        record = decode_game(properties, args.game_kinds)
+                        record = decode_game(properties, args.game_kinds, full_game=not args.card_play_only)
                         examples = replay_examples(record, eligible, args.role, args.include_forced)
                         if not examples:
                             raise RecordError("no_selected_moves")
@@ -133,8 +134,8 @@ def prepare_dataset(args):
         writer.flush()
     manifest = {
         "format_version": DATASET_FORMAT_VERSION,
-        "action_dim": 32,
-        "observation_fields": {name: {"shape": list(shape), "dtype": "int8"}
+        "action_dim": NUM_ACTIONS,
+        "observation_fields": {name: {"shape": list(shape), "dtype": "int16"}
                                for name, (shape, _, _) in OBSERVATION_SPECS.items()},
         "args": vars(args), "counts": dict(counts), "error_examples": errors,
         "splits": {split: writer.shards for split, writer in writers.items()},
@@ -155,7 +156,8 @@ def _parse_args():
     parser.add_argument("--min-rating", type=float, default=1000)
     parser.add_argument("--min-prior-games", type=int, default=0)
     parser.add_argument("--role", choices=["both", "declarer", "defender"], default="both")
-    parser.add_argument("--game-kinds", nargs="+", choices=["suit", "grand"], default=["suit", "grand"])
+    parser.add_argument("--game-kinds", nargs="+", choices=["suit", "grand", "null"], default=["suit", "grand", "null"])
+    parser.add_argument("--card-play-only", action="store_true", help="Extract only play decisions, omitting auction/setup.")
     parser.add_argument("--include-forced", action=argparse.BooleanOptionalAction, default=True,
                         help="Include single-legal-action states for value training (default: enabled).")
     parser.add_argument("--validation-fraction", type=float, default=0.1)

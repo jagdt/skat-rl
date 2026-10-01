@@ -1,7 +1,7 @@
 import pytest
 
 from skat_rl.engine.cards import Rank, Suit, make_card
-from skat_rl.engine.state import GameKind, GameState, GameType, Trick
+from skat_rl.engine.state import GameKind, GameState, GameType, Phase, Trick
 
 
 def test_trick_lead_card_and_completion():
@@ -24,6 +24,23 @@ def test_trick_lead_card_and_completion():
 def test_empty_trick_has_no_lead_card():
     with pytest.raises(ValueError, match="no lead card"):
         Trick(leader=0).lead_card()
+
+
+@pytest.mark.parametrize("phase", list(Phase))
+def test_termination_is_derived_from_phase_and_read_only(phase):
+    state = GameState(
+        hands=[set(), set(), set()], skat=[], declarer=-1, game_type=None,
+        current_player=0, current_trick=Trick(leader=0), phase=phase,
+    )
+    assert state.terminated is (phase == Phase.TERMINAL)
+    assert "terminated" not in vars(state)
+    assert state.clone_public_for_player(0)["terminated"] is state.terminated
+    with pytest.raises(AttributeError):
+        state.terminated = not state.terminated
+    state.phase = Phase.TERMINAL
+    assert state.terminated
+    state.phase = Phase.BIDDING
+    assert not state.terminated
 
 
 def test_clone_public_for_player_returns_public_view_and_own_hand():

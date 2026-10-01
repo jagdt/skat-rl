@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <set>
 
 namespace skat_rl {
 
@@ -68,6 +69,18 @@ void seed_rng(std::mt19937& rng, uint64_t seed) {
 }
 
 }  // namespace
+
+const std::vector<int>& bid_values() {
+    static const std::vector<int> values = [] {
+        std::set<int> bids{23, 35, 46, 59};
+        for (int base : {9, 10, 11, 12}) {
+            for (int multiplier = 2; multiplier <= 18; ++multiplier) bids.insert(base * multiplier);
+        }
+        for (int multiplier = 2; multiplier <= 11; ++multiplier) bids.insert(24 * multiplier);
+        return std::vector<int>(bids.begin(), bids.end());
+    }();
+    return values;
+}
 
 int card_suit(int card) {
     validate_card(card);
@@ -171,9 +184,22 @@ void FastSkatGame::clear_state() {
     game_kind_ = SUIT;
     trump_suit_ = 0;
     current_player_ = 0;
+    phase_ = CARD_PLAY;
+    forehand_ = 0;
+    winning_bid_ = 0;
+    bid_index_ = 0;
+    auction_caller_ = 1;
+    auction_holder_ = 0;
+    auction_role_ = CALLER;
+    rearhand_entered_ = false;
+    forehand_offer_ = false;
+    bid_status_.fill(NOT_ENTERED);
+    highest_called_.fill(-1);
+    highest_held_.fill(-1);
+    pass_threshold_.fill(-1);
+    pass_role_.fill(-1);
     trick_index_ = 0;
     trick_pos_ = 0;
-    terminated_ = false;
     declarer_took_trick_ = false;
     hand_game_ = false;
     declarer_tricks_ = 0;
@@ -188,9 +214,8 @@ void FastSkatGame::clear_state() {
     current_trick_players_.fill(-1);
 }
 
-void FastSkatGame::reset(uint64_t seed) {
+void FastSkatGame::deal(uint64_t seed) {
     clear_state();
-    hand_game_ = true;
     seed_rng(rng_, seed);
 
     std::array<int, kNumCards> deck{};
@@ -206,6 +231,11 @@ void FastSkatGame::reset(uint64_t seed) {
     }
     skat_[0] = deck[30];
     skat_[1] = deck[31];
+}
+
+void FastSkatGame::reset(uint64_t seed) {
+    deal(seed);
+    hand_game_ = true;
     declarer_ = choose_declarer();
     game_kind_ = SUIT;
     trump_suit_ = choose_trump_suit(hands_[declarer_]);
@@ -244,6 +274,31 @@ void FastSkatGame::reset_fixed_declarer(uint64_t seed, int fixed_declarer) {
     }
 }
 
+void FastSkatGame::begin_auction(int forehand) {
+    validate_player(forehand);
+    phase_ = BIDDING;
+    forehand_ = forehand;
+    declarer_ = -1;
+    game_kind_ = -1;
+    trump_suit_ = -1;
+    hand_game_ = false;
+    auction_holder_ = forehand;
+    auction_caller_ = (forehand + 1) % kNumPlayers;
+    current_player_ = auction_caller_;
+    bid_status_[auction_holder_] = bid_status_[auction_caller_] = ACTIVE;
+}
+
+void FastSkatGame::reset_full(uint64_t seed) {
+    deal(seed);
+    begin_auction(std::uniform_int_distribution<int>(0, 2)(rng_));
+}
+
+void FastSkatGame::reset_full_from_deal(const std::vector<std::vector<int>>& hands,
+                                     const std::vector<int>& skat, int forehand) {
+    reset_from_deal(hands, skat, 0, SUIT, 0, forehand);
+    begin_auction(forehand);
+}
+
 void FastSkatGame::reset_from_deal(
     const std::vector<std::vector<int>>& hands,
     const std::vector<int>& skat,
@@ -269,6 +324,9 @@ void FastSkatGame::reset_from_deal(
             throw std::invalid_argument("Each hand must contain exactly ten cards.");
         }
         hands_[player] = cards_to_mask(hands[player]);
+        if (mask_to_cards(hands_[player]).size() != kCardsPerHand) {
+            throw std::invalid_argument("Duplicate card within a hand.");
+        }
         if (seen & hands_[player]) {
             throw std::invalid_argument("Duplicate card in hands.");
         }
@@ -291,7 +349,7 @@ void FastSkatGame::reset_from_deal(
 }
 
 uint32_t FastSkatGame::legal_mask_bits() const {
-    if (terminated_) {
+    if (phase_ != CARD_PLAY) {
         return 0;
     }
 
@@ -312,28 +370,58 @@ uint32_t FastSkatGame::legal_mask_bits() const {
 }
 
 std::vector<int> FastSkatGame::legal_actions() const {
-    return mask_to_cards(legal_mask_bits());
+    if (phase_ == CARD_PLAY) return mask_to_cards(legal_mask_bits());
+    std::vector<int> actions;
+    for (int action = 0; action < kNumActions; ++action) {
+        if (is_legal_action(action)) actions.push_back(action);
+    }
+    return actions;
+}
+
+bool FastSkatGame::is_legal_action(int action) const {
+    if (is_terminal() || action < 0 || action >= kNumActions) return false;
+    switch (phase_) {
+        case BIDDING: case PICKUP_DECISION: return action < 2;
+        case DISCARD: return true;
+        case CONTRACT_SELECTION:
+            return action < 5 || (action == NULL_CONTRACT && winning_bid_ <= (hand_game_ ? 35 : 23));
+        case CARD_PLAY:
+            return action < kNumCards && (legal_mask_bits() & (uint32_t{1} << action)) != 0;
+        default: return false;
+    }
 }
 
 std::vector<bool> FastSkatGame::legal_mask_array() const {
-    const uint32_t mask = legal_mask_bits();
-    std::vector<bool> values(kNumCards, false);
-    for (int card = 0; card < kNumCards; ++card) {
-        values[card] = static_cast<bool>(mask & (uint32_t{1} << card));
-    }
+    std::vector<bool> values(kNumActions, false);
+    for (int action : legal_actions()) values[action] = true;
     return values;
 }
 
 StructuredObservation FastSkatGame::build_observation(int player) const {
     validate_player(player);
     StructuredObservation obs;
-    obs.phase = terminated_ ? TERMINAL : CARD_PLAY;
-    obs.contract = game_kind_ == SUIT ? trump_suit_ :
-                   (game_kind_ == GRAND ? GRAND_CONTRACT : NULL_CONTRACT);
-    obs.relative_declarer = (declarer_ - player + kNumPlayers) % kNumPlayers;
+    obs.phase = phase_;
+    if (game_kind_ >= 0) {
+        obs.contract = game_kind_ == SUIT ? trump_suit_ :
+                       (game_kind_ == GRAND ? GRAND_CONTRACT : NULL_CONTRACT);
+    }
+    if (declarer_ >= 0) obs.relative_declarer = (declarer_ - player + kNumPlayers) % kNumPlayers;
     const int leader = trick_pos_ > 0 ? current_trick_players_[0] : current_player_;
-    obs.relative_current_leader = (leader - player + kNumPlayers) % kNumPlayers;
-    obs.current_trick = std::min(trick_index_, kMaxTricks - 1);
+    if (game_kind_ >= 0) obs.relative_current_leader = (leader - player + kNumPlayers) % kNumPlayers;
+    obs.current_trick = std::max(0, trick_index_ - int(is_terminal()));
+    obs.seat = (player - forehand_ + kNumPlayers) % kNumPlayers;
+    obs.auction_role = phase_ == BIDDING ? auction_role_ : -1;
+    obs.decision_threshold = decision_threshold();
+    obs.winning_bid = winning_bid_;
+    obs.hand_game = (phase_ == BIDDING || phase_ == PICKUP_DECISION || declarer_ < 0) ? -1 : int(hand_game_);
+    for (int relative = 0; relative < kNumPlayers; ++relative) {
+        const int absolute = (player + relative) % kNumPlayers;
+        obs.bid_status[relative] = bid_status_[absolute];
+        obs.highest_called[relative] = highest_called_[absolute];
+        obs.highest_held[relative] = highest_held_[absolute];
+        obs.pass_threshold[relative] = pass_threshold_[absolute];
+        obs.pass_role[relative] = pass_role_[absolute];
+    }
     // Only public trick points, never the hidden Skat.
     obs.declarer_points = declarer_points();
     obs.defender_points = defender_points();
@@ -341,6 +429,9 @@ StructuredObservation FastSkatGame::build_observation(int player) const {
         if (hands_[player] & (uint32_t{1} << card)) {
             obs.card_status[card] = OWN;
         }
+    }
+    if (obs.hand_game == 0 && player == declarer_) {
+        for (int card : skat_) if (card >= 0) obs.card_status[card] = KNOWN_DISCARD;
     }
     const auto record_trick = [&](const auto& cards, const auto& players, int trick, int size) {
         if (size == 0) {
@@ -362,7 +453,7 @@ StructuredObservation FastSkatGame::build_observation(int player) const {
     for (int trick = 0; trick < trick_index_; ++trick) {
         record_trick(history_cards_[trick], history_players_[trick], trick, kTrickSize);
     }
-    if (!terminated_) {
+    if (!is_terminal()) {
         record_trick(current_trick_cards_, current_trick_players_, trick_index_, trick_pos_);
     }
     return obs;
@@ -373,6 +464,7 @@ std::vector<int> FastSkatGame::belief_targets(int player) const {
     const int next_opponent = (player + 1) % kNumPlayers;
     const int previous_opponent = (player + 2) % kNumPlayers;
     std::vector<int> targets(kNumCards, -1);
+    if (is_terminal()) return targets;
 
     for (int card = 0; card < kNumCards; ++card) {
         const uint32_t bit = uint32_t{1} << card;
@@ -380,7 +472,8 @@ std::vector<int> FastSkatGame::belief_targets(int player) const {
             targets[card] = 0;
         } else if (hands_[previous_opponent] & bit) {
             targets[card] = 1;
-        } else if (card == skat_[0] || card == skat_[1]) {
+        } else if ((card == skat_[0] || card == skat_[1])
+                   && (player != declarer_ || hand_game_ || phase_ == PICKUP_DECISION)) {
             targets[card] = 2;
         }
     }
@@ -388,15 +481,15 @@ std::vector<int> FastSkatGame::belief_targets(int player) const {
 }
 
 StepInfo FastSkatGame::step(int action) {
-    validate_card(action);
-    if (terminated_) {
+    if (is_terminal()) {
         throw std::runtime_error("Cannot step terminated game. Call reset().");
     }
 
-    const uint32_t action_bit = (uint32_t{1} << action);
-    if ((legal_mask_bits() & action_bit) == 0) {
+    if (!is_legal_action(action)) {
         throw std::invalid_argument("Illegal action.");
     }
+    if (phase_ != CARD_PLAY) return step_preplay(action);
+    const uint32_t action_bit = (uint32_t{1} << action);
 
     const int player = current_player_;
     hands_[player] &= ~action_bit;
@@ -419,8 +512,8 @@ StepInfo FastSkatGame::step(int action) {
         }
 
         ++trick_index_;
-        if (trick_index_ == kMaxTricks) {
-            terminated_ = true;
+        if (trick_index_ == kMaxTricks || (game_kind_ == NULL_GAME && winner == declarer_)) {
+            phase_ = TERMINAL;
         } else {
             current_player_ = winner;
             trick_pos_ = 0;
@@ -431,14 +524,21 @@ StepInfo FastSkatGame::step(int action) {
         current_player_ = (player + 1) % kNumPlayers;
     }
 
+    return step_info();
+}
+
+StepInfo FastSkatGame::step_info() const {
     StepInfo info;
-    info.terminated = terminated_;
+    info.terminated = is_terminal();
+    info.phase = phase_;
+    info.passed_out = is_terminal() && declarer_ < 0;
     info.current_player = current_player_;
     info.trick_index = trick_index_;
-    if (terminated_ && game_kind_ == NULL_GAME) {
+    if (info.passed_out) return info;
+    if (is_terminal() && game_kind_ == NULL_GAME) {
         info.declarer_points = 0;
         info.defender_points = 0;
-    } else if (terminated_) {
+    } else if (is_terminal()) {
         // Include the hidden Skat only in the final score, not in observations.
         info.declarer_points = declarer_points() + card_points(skat_[0]) + card_points(skat_[1]);
         info.defender_points = 120 - info.declarer_points;
@@ -446,23 +546,113 @@ StepInfo FastSkatGame::step(int action) {
         info.declarer_points = declarer_points();
         info.defender_points = defender_points();
     }
-    if (terminated_) {
+    if (is_terminal()) {
         info.declarer_won = declarer_won();
         info.game_value = final_game_value();
+        info.overbid = raw_game_value() < winning_bid_;
     }
     return info;
 }
 
-bool FastSkatGame::is_terminal() const { return terminated_; }
+StepInfo FastSkatGame::step_preplay(int action) {
+    switch (phase_) {
+        case BIDDING: step_bid(action); break;
+        case PICKUP_DECISION:
+            hand_game_ = action == 1;
+            if (hand_game_) phase_ = CONTRACT_SELECTION;
+            else {
+                for (int card : skat_) hands_[declarer_] |= uint32_t{1} << card;
+                skat_.fill(-1);
+                phase_ = DISCARD;
+            }
+            break;
+        case DISCARD: {
+            const auto cards = hand(declarer_);
+            int pair = 0;
+            for (int i = 0; i < 12; ++i) {
+                for (int j = i + 1; j < 12; ++j, ++pair) {
+                    if (pair == action) skat_ = {cards[i], cards[j]};
+                }
+            }
+            for (int card : skat_) hands_[declarer_] &= ~(uint32_t{1} << card);
+            phase_ = CONTRACT_SELECTION;
+            break;
+        }
+        case CONTRACT_SELECTION:
+            game_kind_ = action < 4 ? SUIT : (action == GRAND_CONTRACT ? GRAND : NULL_GAME);
+            trump_suit_ = action < 4 ? action : -1;
+            phase_ = CARD_PLAY;
+            current_player_ = forehand_;
+            break;
+    }
+    return step_info();
+}
+
+void FastSkatGame::step_bid(int action) {
+    const int player = current_player_;
+    const int threshold = bid_values()[bid_index_];
+    if (action == 0) {
+        bid_status_[player] = PASSED;
+        pass_threshold_[player] = threshold;
+        pass_role_[player] = auction_role_;
+        if (forehand_offer_) {
+            phase_ = TERMINAL;
+        } else finish_duel(auction_role_ == CALLER ? auction_holder_ : auction_caller_);
+    } else if (forehand_offer_) finish_auction(player);
+    else if (auction_role_ == CALLER) {
+        highest_called_[player] = threshold;
+        winning_bid_ = threshold;
+        current_player_ = auction_holder_;
+        auction_role_ = HOLDER;
+    } else {
+        highest_held_[player] = threshold;
+        winning_bid_ = threshold;
+        if (threshold == bid_values().back()) finish_auction(player);
+        else {
+            ++bid_index_;
+            current_player_ = auction_caller_;
+            auction_role_ = CALLER;
+        }
+    }
+}
+
+void FastSkatGame::finish_duel(int winner) {
+    if (winning_bid_ == bid_values().back()) finish_auction(winner);
+    else if (!rearhand_entered_) {
+        rearhand_entered_ = true;
+        auction_caller_ = (forehand_ + 2) % kNumPlayers;
+        auction_holder_ = winner;
+        current_player_ = auction_caller_;
+        auction_role_ = CALLER;
+        bid_status_[auction_caller_] = ACTIVE;
+        bid_index_ = std::upper_bound(bid_values().begin(), bid_values().end(), winning_bid_) - bid_values().begin();
+    } else if (winning_bid_ == 0) {
+        forehand_offer_ = true;
+        current_player_ = winner;
+        auction_role_ = CALLER;
+        bid_index_ = 0;
+    } else finish_auction(winner);
+}
+
+void FastSkatGame::finish_auction(int winner) {
+    declarer_ = current_player_ = winner;
+    winning_bid_ = std::max(18, winning_bid_);
+    phase_ = PICKUP_DECISION;
+}
+
+bool FastSkatGame::is_terminal() const { return phase_ == TERMINAL; }
 int FastSkatGame::current_player() const { return current_player_; }
 int FastSkatGame::declarer() const { return declarer_; }
 int FastSkatGame::trick_index() const { return trick_index_; }
 int FastSkatGame::game_kind() const { return game_kind_; }
 int FastSkatGame::trump_suit() const { return trump_suit_; }
 int FastSkatGame::trick_position() const { return trick_pos_; }
+int FastSkatGame::phase() const { return phase_; }
+int FastSkatGame::decision_threshold() const { return phase_ == BIDDING ? bid_values()[bid_index_] : -1; }
+int FastSkatGame::winning_bid() const { return winning_bid_; }
 
 int FastSkatGame::declarer_points() const {
-    return won_points_[declarer_];
+    return declarer_ >= 0 ? won_points_[declarer_] : 0;
 }
 
 int FastSkatGame::defender_points() const {
@@ -481,6 +671,7 @@ std::vector<int> FastSkatGame::hand(int player) const {
 }
 
 std::vector<int> FastSkatGame::skat() const {
+    if (skat_[0] < 0) return {};
     return {skat_[0], skat_[1]};
 }
 
@@ -607,6 +798,7 @@ int FastSkatGame::current_trick_points() const {
 }
 
 bool FastSkatGame::declarer_won() const {
+    if (raw_game_value() < winning_bid_) return false;
     if (game_kind_ == NULL_GAME) {
         return !declarer_took_trick_;
     }
@@ -614,6 +806,13 @@ bool FastSkatGame::declarer_won() const {
 }
 
 int FastSkatGame::final_game_value() const {
+    const int value = raw_game_value();
+    if (value >= winning_bid_) return value;
+    const int base = game_kind_ == GRAND ? 24 : 12 - trump_suit_;
+    return ((winning_bid_ + base - 1) / base) * base;
+}
+
+int FastSkatGame::raw_game_value() const {
     if (game_kind_ == NULL_GAME) {
         return hand_game_ ? 35 : 23;
     }
@@ -646,16 +845,17 @@ int FastSkatGame::final_game_value() const {
     return base * (matadors + 1 + int(hand_game_) + int(schneider) + int(schwarz));
 }
 
-BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer)
+BatchedFastSkatEnv::BatchedFastSkatEnv(int size, int learning_player, int fixed_declarer, bool full_game)
     : games_(size),
       active_(size, 0),
       episode_lengths_(size, 0),
       learning_player_(learning_player),
-      fixed_declarer_(fixed_declarer) {
+      fixed_declarer_(fixed_declarer), full_game_(full_game) {
     if (size < 1) {
         throw std::invalid_argument("BatchedFastSkatEnv size must be at least 1.");
     }
     validate_player(learning_player_);
+    if (full_game_ && fixed_declarer_ != -1) throw std::invalid_argument("Full games determine the declarer by bidding.");
     if (fixed_declarer_ != -1) {
         validate_player(fixed_declarer_);
     }
@@ -676,7 +876,9 @@ void BatchedFastSkatEnv::reset_many(const std::vector<uint64_t>& seeds) {
     }
 
     for (int index = 0; index < size(); ++index) {
-        if (fixed_declarer_ == -1) {
+        if (full_game_) {
+            games_[index].reset_full(seeds[index]);
+        } else if (fixed_declarer_ == -1) {
             games_[index].reset(seeds[index]);
         } else {
             games_[index].reset_fixed_declarer(seeds[index], fixed_declarer_);
@@ -696,8 +898,7 @@ BatchedStepInfo BatchedFastSkatEnv::step(const std::vector<int>& actions) {
     for (std::size_t batch_index = 0; batch_index < indices.size(); ++batch_index) {
         const FastSkatGame& game = games_[indices[batch_index]];
         const int action = actions[batch_index];
-        if (action < 0 || action >= kNumCards
-            || (game.legal_mask_bits() & (uint32_t{1} << action)) == 0) {
+        if (!game.is_legal_action(action)) {
             throw std::invalid_argument("Batch contains an illegal action.");
         }
     }
@@ -775,12 +976,9 @@ std::vector<int> BatchedFastSkatEnv::active_declarers() const {
 std::vector<uint8_t> BatchedFastSkatEnv::active_action_masks() const {
     const std::vector<int> indices = active_indices();
     std::vector<uint8_t> masks;
-    masks.reserve(indices.size() * kNumCards);
+    masks.reserve(indices.size() * kNumActions);
     for (int env_index : indices) {
-        const uint32_t mask_bits = games_[env_index].legal_mask_bits();
-        for (int card = 0; card < kNumCards; ++card) {
-            masks.push_back((mask_bits & (uint32_t{1} << card)) != 0 ? 1 : 0);
-        }
+        for (bool legal : games_[env_index].legal_mask_array()) masks.push_back(legal ? 1 : 0);
     }
     return masks;
 }
@@ -810,11 +1008,11 @@ int BatchedFastSkatEnv::learning_player() const {
 }
 
 int BatchedFastSkatEnv::action_dim() const {
-    return kNumCards;
+    return kNumActions;
 }
 
 float BatchedFastSkatEnv::reward_for_step(const FastSkatGame& game, const StepInfo& info) const {
-    if (!info.terminated) {
+    if (!info.terminated || info.passed_out) {
         return 0.0F;
     }
 

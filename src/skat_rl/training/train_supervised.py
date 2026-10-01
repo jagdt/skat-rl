@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from skat_rl.agents.ppo_agent import PPOAgent, PPOConfig, observation_to_tensors
+from skat_rl.engine.actions import NUM_ACTIONS
 from skat_rl.envs.observations import DATASET_FORMAT_VERSION, OBSERVATION_SPECS
 
 
@@ -25,7 +26,7 @@ class SupervisedBatches(IterableDataset):
         with open(self.directory / "manifest.json", encoding="utf-8") as handle:
             manifest = json.load(handle)
         if (manifest["format_version"] != DATASET_FORMAT_VERSION
-                or manifest["action_dim"] != 32):
+                or manifest["action_dim"] != NUM_ACTIONS):
             raise ValueError("Unsupported prepared dataset format. Regenerate with prepare_supervised.")
         self.files = [shard["file"] for shard in manifest["splits"][split]]
         if not self.files:
@@ -146,7 +147,7 @@ def train(args):
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.torch_threads)
     config = PPOConfig(
-        action_dim=32, architecture="transformer",
+        action_dim=NUM_ACTIONS, architecture="transformer",
         transformer_dim=args.transformer_dim, transformer_layers=args.transformer_layers,
         transformer_heads=args.transformer_heads, transformer_ff_dim=args.transformer_ff_dim,
         transformer_dropout=args.transformer_dropout, learning_rate=args.learning_rate,

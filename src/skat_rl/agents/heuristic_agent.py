@@ -1,6 +1,7 @@
 from skat_rl.engine.cards import Rank, Suit, card_points, card_rank, card_suit, full_deck
 from skat_rl.engine.rules import card_strength_in_trick, is_trump, trick_winner
-from skat_rl.engine.state import GameKind, Trick
+from skat_rl.engine.state import GameKind, Phase, Trick
+from skat_rl.engine.actions import BID_VALUES, DISCARD_PAIRS
 
 
 class HeuristicAgent:
@@ -28,6 +29,9 @@ class HeuristicAgent:
         if not legal_actions:
             raise ValueError("No legal actions available.")
 
+        if observation.get("phase", Phase.CARD_PLAY) != Phase.CARD_PLAY:
+            return self._act_preplay(observation, legal_actions)
+
         player_id = observation["player_id"]
         declarer = observation["declarer"]
         game_type = observation["game_type"]
@@ -49,6 +53,26 @@ class HeuristicAgent:
             current_trick_cards,
             legal_actions,
         )
+
+    def _act_preplay(self, observation, legal_actions):
+        hand = sorted(observation["own_hand"])
+        jacks = sum(card_rank(c) == Rank.JACK for c in hand)
+        aces = sum(card_rank(c) == Rank.ACE for c in hand)
+        tens = sum(card_rank(c) == Rank.TEN for c in hand)
+        phase = observation["phase"]
+        if phase == Phase.BIDDING:
+            limit = min(72, 4 * (4 * jacks + 2 * aces + tens))
+            return int(BID_VALUES[observation["bid_index"]] <= limit)
+        if phase == Phase.PICKUP_DECISION:
+            return 0
+        suit = max(range(4), key=lambda s: (
+            sum(card_suit(c) == s for c in hand), s * 8 + int(Rank.TEN) in hand, -s,
+        ))
+        if phase == Phase.DISCARD:
+            def keep_score(card):
+                return 100 * (card_rank(card) == Rank.JACK) + 40 * (card_suit(card) == suit) + card_points(card)
+            return min(legal_actions, key=lambda a: sum(keep_score(hand[i]) for i in DISCARD_PAIRS[a]))
+        return 4 if jacks >= 3 and aces >= 2 else suit
 
     def _act_as_declarer(self, observation, player_id, game_type, current_trick_cards, legal_actions):
         '''

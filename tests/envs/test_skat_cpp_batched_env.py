@@ -24,9 +24,9 @@ def test_cpp_batched_env_reset_shapes_and_masks(learning_player):
     assert not np.any(state["observations"]["card_status"] == CardStatus.PLAYED)
     for name, (shape, _, _) in OBSERVATION_SPECS.items():
         assert state["observations"][name].shape == (4,) + shape
-        assert state["observations"][name].dtype == np.int8
+        assert state["observations"][name].dtype == np.int16
     assert env.observation_space.contains(index_observations(state["observations"], 0))
-    assert state["action_masks"].shape == (4, 32)
+    assert state["action_masks"].shape == (4, 66)
     assert state["action_masks"].dtype == bool
     assert state["action_masks"].any(axis=1).all()
     assert state["belief_targets"].shape == (4, 32)
@@ -133,7 +133,7 @@ def test_external_turns_match_individual_games_for_every_player(learning_player)
     assert env.active_count() == 0
     for name, (shape, _, _) in OBSERVATION_SPECS.items():
         assert state["observations"][name].shape == (0,) + shape
-    assert state["action_masks"].shape == (0, 32)
+    assert state["action_masks"].shape == (0, 66)
     assert state["belief_targets"].shape == (0, 32)
     assert state["current_players"].shape == (0,)
     assert state["declarers"].shape == (0,)

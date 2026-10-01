@@ -36,14 +36,17 @@ RECORDED_GAME = (
 )
 
 
-def generated_record(seed):
+def generated_record(seed, full_game=False):
     def code(card):
         return "CSHD"[card // 8] + "789QKTAJ"[card % 8]
 
     game = SkatGame()
     state = game.reset(game_type=GameType(GameKind.GRAND, hand=True), declarer=seed % 3, seed=seed)
     deck = [c for hand in state.hands for c in sorted(hand)] + state.skat
-    moves = ["w", ".".join(map(code, deck)), str(state.declarer), "GH"]
+    moves = ["w", ".".join(map(code, deck))]
+    if full_game:
+        moves += ["1 p 2 p 0 18", "1 18 0 p 2 p", "1 p 2 18 0 p"][state.declarer].split()
+    moves += [str(state.declarer), "GH"]
     while not state.terminated:
         action = game.legal_actions()[0]
         moves.extend([str(state.current_player), code(action)])
@@ -59,17 +62,19 @@ def generated_record(seed):
 def prepare_args(path, output, **overrides):
     values = dict(inputs=[str(path)], output_dir=str(output), min_rating=1000,
                   min_prior_games=0, role="both", game_kinds=["suit", "grand"],
-                  include_forced=True, validation_fraction=0.3, seed=42, shard_size=64, max_games=None)
+                  include_forced=True, validation_fraction=0.3, seed=42, shard_size=64, max_games=None,
+                  card_play_only=True)
     values.update(overrides)
     return argparse.Namespace(**values)
 
 
-@pytest.fixture
-def prepared(tmp_path):
+@pytest.fixture(params=[False, True])
+def prepared(tmp_path, request):
+    full_game = request.param
     source = tmp_path / "games.sgf"
-    source.write_text("".join(generated_record(seed) for seed in range(20)))
+    source.write_text("".join(generated_record(seed, full_game=full_game) for seed in range(20)))
     directory = tmp_path / "prepared"
-    manifest = prepare_dataset(prepare_args(source, directory))
+    manifest = prepare_dataset(prepare_args(source, directory, card_play_only=not full_game))
     return directory, manifest
 
 
@@ -179,15 +184,20 @@ def test_shards_exclude_weak_players_and_keep_games_in_one_split(prepared):
                 # Generated games use seed % 3 as declarer; recover seat only in this test.
                 declarers = np.array([int(json.loads(identity)[1]) % 3 for identity in data["game_ids"]])
                 teachers = (declarers - data["obs_relative_declarer"]) % 3
-                assert np.all(teachers != 1)  # Bob is below 1000.
+                # Before bidding finishes the eventual declarer is intentionally hidden.
+                known = data["obs_relative_declarer"] >= 0
+                assert np.all(teachers[known] != 1)  # Bob is below 1000.
                 assert "observations" not in data
                 for name, (shape, _, _) in OBSERVATION_SPECS.items():
                     assert data[f"obs_{name}"].shape == (len(data["actions"]),) + shape
-                    assert data[f"obs_{name}"].dtype == np.int8
+                    assert data[f"obs_{name}"].dtype == np.int16
                 assert np.all(data["action_masks"].sum(axis=1) >= 1)
                 count += len(data["actions"])
         assert count == manifest["counts"][f"{split}_examples"]
-        assert count == 20 * manifest["counts"][f"{split}_games"]
+        if manifest["args"]["card_play_only"]:
+            assert count == 20 * manifest["counts"][f"{split}_games"]
+        else:
+            assert count > 20 * manifest["counts"][f"{split}_games"]
     assert manifest["args"]["include_forced"] is True
     assert "trusted_players" not in manifest["args"]
     assert not identities["train"] & identities["validation"]
@@ -228,7 +238,7 @@ def test_prepare_can_exclude_forced_moves(tmp_path):
 def test_supervised_epoch_updates_policy_and_optional_value_head(prepared, value_coef):
     torch.set_num_threads(1)
     directory, _ = prepared
-    config = PPOConfig(action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=66, architecture="transformer",
                        transformer_dim=16, transformer_layers=1, transformer_heads=2,
                        transformer_ff_dim=32, use_belief=True, value_coef=value_coef)
     agent = PPOAgent(config, device="cpu")
@@ -257,7 +267,7 @@ def test_full_training_checkpoint_initializes_ppo_with_fresh_optimizer(prepared,
     path = train(args)
     loaded = PPOAgent.load(path, device="cpu")
     assert torch.load(path, weights_only=True)["critic_pretrained"] is True
-    config = PPOConfig(action_dim=32, learning_rate=2e-4, gamma=.95)
+    config = PPOConfig(action_dim=66, learning_rate=2e-4, gamma=.95)
     ppo = initialize_agent(config, path, device="cpu")
     assert ppo.config.transformer_dim == 16
     assert ppo.config.learning_rate == 2e-4
@@ -291,7 +301,7 @@ def test_outcomes_are_discounted_by_player_decisions_not_selected_examples():
 
 def test_value_loss_uses_discounted_outcome(prepared):
     directory, _ = prepared
-    config = PPOConfig(action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=66, architecture="transformer",
                        transformer_dim=16, transformer_layers=1, transformer_heads=2,
                        transformer_ff_dim=32, gamma=.8)
     agent = PPOAgent(config, device="cpu")
@@ -326,3 +336,64 @@ def test_replay_checks_recorded_game_value():
     record = decode_game(parse_record(RECORDED_GAME.replace("v:48", "v:49")))
     with pytest.raises(RecordError, match="game_value_mismatch"):
         replay_examples(record, [True] * 3)
+
+
+def test_full_record_produces_phase_specific_targets_and_correct_discount_horizons():
+    from skat_rl.engine.state import Phase
+
+    record = decode_game(parse_record(RECORDED_GAME), full_game=True)
+    examples = replay_examples(record, [True] * 3)
+    assert len(examples) == 37
+    assert [e["observations"]["phase"] for e in examples[:7]] == [
+        Phase.BIDDING, Phase.BIDDING, Phase.BIDDING, Phase.BIDDING,
+        Phase.PICKUP_DECISION, Phase.DISCARD, Phase.CONTRACT_SELECTION,
+    ]
+    assert all(e["action_masks"].shape == (66,) and e["action_masks"][e["actions"]] for e in examples)
+    assert np.count_nonzero(examples[4]["observations"]["card_status"] == CardStatus.OWN) == 10
+    assert np.count_nonzero(examples[5]["observations"]["card_status"] == CardStatus.OWN) == 12
+    assert np.count_nonzero(examples[6]["observations"]["card_status"] == CardStatus.KNOWN_DISCARD) == 2
+    teacher = replay_examples(decode_game(parse_record(RECORDED_GAME), full_game=True), [False, False, True])
+    assert len(teacher) == 14
+    assert [e["remaining_decisions"] for e in teacher] == list(range(13, -1, -1))
+    assert [e["terminal_rewards"] for e in teacher] == pytest.approx([.98] * 14)
+
+
+def test_full_record_bid_jumps_preserve_actual_threshold_without_fabricated_calls():
+    record = decode_game(parse_record(RECORDED_GAME.replace("1 18 0 p 2 20", "1 22 0 p 2 24")), full_game=True)
+    examples = replay_examples(record, [True] * 3)
+    assert len(examples) == 37
+    assert [int(e["observations"]["decision_threshold"]) for e in examples[:4]] == [22, 22, 24, 24]
+    assert examples[4]["observations"]["highest_called"].tolist() == [24, -1, 22]
+
+
+def test_full_record_rejects_missing_auction_but_card_play_mode_accepts_it():
+    with pytest.raises(RecordError, match="missing_auction"):
+        decode_game(parse_record(generated_record(1)), full_game=True)
+    assert len(replay_examples(decode_game(parse_record(generated_record(1))), [True] * 3)) == 30
+
+
+def test_passed_out_record_has_three_zero_outcome_bidding_examples():
+    properties = parse_record(RECORDED_GAME)
+    properties["MV"] = " ".join(properties["MV"].split()[:2]) + " 1 p 2 p 0 p"
+    properties["R"] = "passed"
+    record = decode_game(properties, full_game=True)
+    examples = replay_examples(record, [True] * 3)
+    assert len(examples) == 3
+    assert all(e["actions"] == 0 and e["terminal_rewards"] == 0 and e["remaining_decisions"] == 0 for e in examples)
+    assert record.game.state.terminated
+
+
+def test_full_game_supervised_batch_updates_all_policy_heads():
+    torch.set_num_threads(1)
+    examples = replay_examples(decode_game(parse_record(RECORDED_GAME), full_game=True), [True] * 3)
+    from skat_rl.envs.observations import stack_observations
+    batch = {key: torch.as_tensor(np.asarray([e[key] for e in examples]))
+             for key in ("actions", "action_masks", "belief_targets", "terminal_rewards", "remaining_decisions")}
+    batch["observations"] = observation_to_tensors(stack_observations(e["observations"] for e in examples), "cpu")
+    agent = PPOAgent(PPOConfig(architecture="transformer", transformer_dim=16, transformer_layers=1,
+                               transformer_heads=2, transformer_ff_dim=32, use_belief=True), "cpu")
+    before = {name: p.detach().clone() for name, p in agent.model.named_parameters()}
+    metrics = run_epoch(agent, [batch], training=True)
+    assert np.isfinite(metrics["loss"])
+    for head in ("bid_head", "pickup_head", "discard_head", "contract_head", "policy_head", "value_head", "belief_head"):
+        assert any(not torch.equal(before[n], p) for n, p in agent.model.named_parameters() if n.startswith(head + "."))

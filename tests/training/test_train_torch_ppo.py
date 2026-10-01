@@ -20,6 +20,31 @@ def test_belief_cli_flag_is_explicit(monkeypatch):
     assert train_torch_ppo._parse_args().use_belief is True
 
 
+def test_training_defaults_to_full_game_with_card_play_opt_out(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo"])
+    assert not train_torch_ppo._parse_args().card_play_only
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo", "--card-play-only"])
+    assert train_torch_ppo._parse_args().card_play_only
+    monkeypatch.setattr(sys, "argv", ["train_torch_ppo", "--fixed-declarer", "0"])
+    with pytest.raises(ValueError, match="requires --card-play-only"):
+        train_torch_ppo.main()
+
+
+def test_passed_out_rollouts_credit_zero_return_to_the_last_learner_action():
+    class PassPolicy:
+        config = train_torch_ppo.PPOConfig(gamma=1, gae_lambda=1)
+
+        def get_action_and_value(self, observations, masks):
+            return np.zeros(len(masks), dtype=np.int64), np.zeros(len(masks)), np.zeros(len(masks))
+
+    env = train_torch_ppo.SkatCppBatchedSingleAgentEnv(8, full_game=True)
+    rollout, episodes, steps = train_torch_ppo._collect_cpp_batched_rollout(PassPolicy(), env, 0, PassPolicy())
+    assert steps == 8 and len(episodes) == 8
+    assert np.all(rollout.dones == 1)
+    assert np.all(rollout.rewards == 0) and np.all(rollout.returns == 0)
+    assert all(ep["length"] == 1 and ep["return"] == 0 for ep in episodes)
+
+
 def test_belief_flag_rejects_mlp_architecture(monkeypatch):
     monkeypatch.setattr(sys, "argv", [
         "train_torch_ppo", "--architecture", "mlp", "--belief",
@@ -31,7 +56,7 @@ def test_belief_flag_rejects_mlp_architecture(monkeypatch):
 def test_belief_flag_rejects_no_belief_checkpoint(monkeypatch, tmp_path):
     checkpoint = tmp_path / "model.pt"
     config = train_torch_ppo.PPOConfig(
-        action_dim=32, architecture="transformer",
+        action_dim=66, architecture="transformer",
         transformer_dim=32, transformer_layers=1, transformer_heads=4,
         transformer_ff_dim=64,
     )
@@ -61,6 +86,7 @@ def test_env_seed_derives_deterministic_distinct_parallel_seeds():
 def test_make_env_uses_python_env_by_default():
     args = argparse.Namespace(
         env="python",
+        card_play_only=True,
         learning_player=0,
         fixed_declarer=0,
         seed=42,
@@ -187,7 +213,7 @@ def test_collect_cpp_batched_rollout_collects_complete_games():
     assert global_step == 20
     assert [episode["length"] for episode in episodes] == [10, 10]
     assert rollout.observations["card_status"].shape == (20, 32)
-    assert rollout.action_masks.shape == (20, 32)
+    assert rollout.action_masks.shape == (20, 66)
     assert rollout.belief_targets.shape == (20, 32)
     assert set(np.unique(rollout.belief_targets)) <= {-1, 0, 1, 2}
 
@@ -197,7 +223,7 @@ def test_collect_cpp_batched_rollout_without_belief_skips_targets():
         rollout_size=2, learning_player=0, fixed_declarer=0, seed=1,
     )
     config = train_torch_ppo.PPOConfig(
-        action_dim=32, architecture="transformer",
+        action_dim=66, architecture="transformer",
         use_belief=False, transformer_dim=32, transformer_layers=1,
         transformer_heads=4, transformer_ff_dim=64,
     )
@@ -217,7 +243,7 @@ def test_collect_cpp_batched_rollout_without_belief_skips_targets():
 def test_fixed_opponent_collection_batches_policies_and_credits_terminal_reward(learning_player):
     class RecordingPolicy:
         config = train_torch_ppo.PPOConfig(
-            action_dim=32, architecture="transformer",
+            action_dim=66, architecture="transformer",
             use_belief=True, gamma=1.0, gae_lambda=1.0,
         )
 
@@ -272,7 +298,7 @@ def test_fixed_opponent_collection_batches_policies_and_credits_terminal_reward(
 
 def _small_transformer_config(**overrides):
     values = dict(
-        action_dim=32, architecture="transformer",
+        action_dim=66, architecture="transformer",
         transformer_dim=16, transformer_layers=1, transformer_heads=2,
         transformer_ff_dim=32, update_epochs=1, minibatch_size=20,
     )
@@ -386,7 +412,8 @@ def test_opponent_checkpoint_rejects_incompatible_dimensions(tmp_path):
         train_torch_ppo.load_frozen_opponent(path, _small_transformer_config(), "cpu")
 
 
-def test_fixed_opponent_cli_trains_and_saves_run(tmp_path, monkeypatch):
+@pytest.mark.parametrize("card_play_only", [False, True])
+def test_fixed_opponent_cli_trains_and_saves_run(tmp_path, monkeypatch, card_play_only):
     from skat_rl.training.train_supervised import save_pretrained
 
     torch.set_num_threads(1)
@@ -400,6 +427,8 @@ def test_fixed_opponent_cli_trains_and_saves_run(tmp_path, monkeypatch):
         "--update-epochs", "1", "--minibatch-size", "20", "--device", "cpu",
         "--output-dir", str(tmp_path / "runs"),
     ])
+    if card_play_only:
+        sys.argv.append("--card-play-only")
     train_torch_ppo.main()
     run = next((tmp_path / "runs").iterdir())
     assert (run / "model.pt").is_file()
@@ -409,12 +438,14 @@ def test_fixed_opponent_cli_trains_and_saves_run(tmp_path, monkeypatch):
     assert config["args"]["opponent_model"] == str(path)
     with (run / "metrics.csv").open() as handle:
         metrics = list(csv.DictReader(handle))
-    assert [int(row["total_timesteps"]) for row in metrics] == [20, 40]
+    assert int(metrics[-1]["total_timesteps"]) >= 40
     assert all(np.isfinite(float(row["loss"])) for row in metrics)
     with (run / "episodes.csv").open() as handle:
         episodes = list(csv.DictReader(handle))
-    assert len(episodes) == 4
-    assert all(int(row["length"]) == 10 for row in episodes)
+    assert sum(int(row["length"]) for row in episodes) == int(metrics[-1]["total_timesteps"])
+    if card_play_only:
+        assert len(episodes) == 4
+        assert all(int(row["length"]) == 10 for row in episodes)
 
 
 @pytest.mark.parametrize("architecture", ["mlp", "transformer"])

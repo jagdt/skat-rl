@@ -44,7 +44,7 @@ def test_legal_mask_contains_only_current_player_hand_cards():
 
     assert legal_actions
     assert legal_actions <= hand
-    assert len(mask) == 32
+    assert len(mask) == 66
     assert {card for card, is_legal in enumerate(mask) if is_legal} == legal_actions
 
 

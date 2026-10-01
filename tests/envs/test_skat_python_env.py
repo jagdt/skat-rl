@@ -15,7 +15,7 @@ def test_observation_matches_structured_space():
     assert env.game._choose_declarer(env.game.state.hands) == 0
     assert env.observation_space.contains(observation)
     assert observation["card_status"].shape == (32,)
-    assert all(value.dtype == np.int8 for value in observation.values())
+    assert all(value.dtype == np.int16 for value in observation.values())
 
 
 def test_nonzero_learning_player_is_fixed_declarer():

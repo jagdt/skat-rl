@@ -3,6 +3,8 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from skat_rl.engine.game import SkatGame
+from skat_rl.engine.actions import NUM_ACTIONS
+from skat_rl.engine.state import Phase
 from skat_rl.engine.rules import effective_suit
 from skat_rl.envs.observations import build_observation, encode_belief_targets, observation_space
 from skat_rl.agents.heuristic_agent import HeuristicAgent
@@ -17,7 +19,7 @@ class SkatSingleAgentEnv(gym.Env):
     All other players are controlled by heuristic agents.
 
     Action space:
-        Discrete(32), one action per card.
+        Discrete(66), phase-local actions with a legal action mask.
 
     Observation: semantic per-card and global fields in the learning player's
     SELF/LEFT/RIGHT coordinates. Privileged belief labels are returned separately.
@@ -25,12 +27,15 @@ class SkatSingleAgentEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, learning_player=0, opponent_agents=None, fixed_declarer=None, seed=None):
+    def __init__(self, learning_player=0, opponent_agents=None, fixed_declarer=None, seed=None, full_game=False):
         super().__init__()
 
         self.learning_player = learning_player
         self.seed_value = seed
         self.fixed_declarer = fixed_declarer
+        self.full_game = full_game
+        if full_game and fixed_declarer is not None:
+            raise ValueError("Full games determine the declarer by bidding.")
 
         self.game = SkatGame(fixed_declarer=self.fixed_declarer, seed=seed)
         self._reset_void_info_cache()
@@ -41,17 +46,14 @@ class SkatSingleAgentEnv(gym.Env):
 
         self.opponent_agents = opponent_agents
 
-        self.action_space = spaces.Discrete(32)
+        self.action_space = spaces.Discrete(NUM_ACTIONS)
 
         self.observation_space = observation_space()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        if seed is not None:
-            self.game.reset(seed=seed)
-        else:
-            self.game.reset()
+        self.game.reset(seed=seed, full_game=self.full_game)
 
         self._reset_void_info_cache()
         self._play_until_learning_player()
@@ -100,11 +102,11 @@ class SkatSingleAgentEnv(gym.Env):
         """
         Required by sb3-contrib MaskablePPO.
 
-        Returns a boolean mask of shape (32,).
+        Returns a boolean mask of shape (66,).
         True means action is legal.
         False means action is illegal.
         """
-        mask = np.zeros(32, dtype=bool)
+        mask = np.zeros(NUM_ACTIONS, dtype=bool)
 
         if self.game.state is None:
             return mask
@@ -179,7 +181,7 @@ class SkatSingleAgentEnv(gym.Env):
 
     def _update_void_info_for_action(self, player, action):
         state = self.game.state
-        if state is None or state.terminated:
+        if state is None or state.terminated or state.phase != Phase.CARD_PLAY:
             return
 
         trick = state.current_trick

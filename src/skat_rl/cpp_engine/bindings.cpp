@@ -16,6 +16,9 @@ namespace {
 py::dict step_info_to_dict(const skat_rl::StepInfo& info) {
     py::dict result;
     result["terminated"] = info.terminated;
+    result["phase"] = info.phase;
+    result["passed_out"] = info.passed_out;
+    result["overbid"] = info.overbid;
     result["current_player"] = info.current_player;
     result["trick_index"] = info.trick_index;
     result["declarer_points"] = info.declarer_points;
@@ -32,6 +35,9 @@ py::dict step_info_to_dict(const skat_rl::StepInfo& info) {
 py::dict state_summary(const skat_rl::FastSkatGame& game) {
     py::dict result;
     result["terminated"] = game.is_terminal();
+    result["phase"] = game.phase();
+    result["decision_threshold"] = game.decision_threshold();
+    result["winning_bid"] = game.winning_bid();
     result["current_player"] = game.current_player();
     result["declarer"] = game.declarer();
     result["game_kind"] = game.game_kind();
@@ -76,16 +82,16 @@ std::vector<uint64_t> uint64_vector_from_sequence(const py::sequence& values) {
 }
 
 template <typename T>
-py::array_t<int8_t> observation_field(
+py::array_t<int16_t> observation_field(
     const std::vector<skat_rl::StructuredObservation>& observations,
     T skat_rl::StructuredObservation::* member, std::vector<py::ssize_t> shape, bool batched
 ) {
     if (batched) {
         shape.insert(shape.begin(), static_cast<py::ssize_t>(observations.size()));
     }
-    py::array_t<int8_t> result(shape);
+    py::array_t<int16_t> result(shape);
     for (std::size_t row = 0; row < observations.size(); ++row) {
-        std::memcpy(result.mutable_data() + row * sizeof(T), &(observations[row].*member), sizeof(T));
+        std::memcpy(result.mutable_data() + row * sizeof(T) / sizeof(int16_t), &(observations[row].*member), sizeof(T));
     }
     return result;
 }
@@ -106,6 +112,16 @@ py::dict observation_dict(const std::vector<skat_rl::StructuredObservation>& obs
     result["defender_points"] = observation_field(observations, &Observation::defender_points, {}, batched);
     result["current_trick"] = observation_field(observations, &Observation::current_trick, {}, batched);
     result["void_info"] = observation_field(observations, &Observation::void_info, {3, 5}, batched);
+    result["seat"] = observation_field(observations, &Observation::seat, {}, batched);
+    result["auction_role"] = observation_field(observations, &Observation::auction_role, {}, batched);
+    result["decision_threshold"] = observation_field(observations, &Observation::decision_threshold, {}, batched);
+    result["winning_bid"] = observation_field(observations, &Observation::winning_bid, {}, batched);
+    result["hand_game"] = observation_field(observations, &Observation::hand_game, {}, batched);
+    result["bid_status"] = observation_field(observations, &Observation::bid_status, {3}, batched);
+    result["highest_called"] = observation_field(observations, &Observation::highest_called, {3}, batched);
+    result["highest_held"] = observation_field(observations, &Observation::highest_held, {3}, batched);
+    result["pass_threshold"] = observation_field(observations, &Observation::pass_threshold, {3}, batched);
+    result["pass_role"] = observation_field(observations, &Observation::pass_role, {3}, batched);
     return result;
 }
 
@@ -171,7 +187,7 @@ py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
     result["action_masks"] = bool_array(
         env.active_action_masks(),
         active_count,
-        skat_rl::kNumCards
+        skat_rl::kNumActions
     );
     result["belief_targets"] = int_array_2d(
         env.active_belief_targets(),
@@ -184,10 +200,19 @@ py::dict batched_step_info_to_dict(const skat_rl::BatchedFastSkatEnv& env,
 }  // namespace
 
 PYBIND11_MODULE(_skat_cpp, m) {
-    m.doc() = "C++ Skat card-play engine core";
+    m.doc() = "C++ Skat engine core; explicit actions for every player and phase";
+    m.def("bid_values", &skat_rl::bid_values);
 
     py::class_<skat_rl::FastSkatGame>(m, "FastSkatGame")
         .def(py::init<>())
+        .def("reset_full", [](skat_rl::FastSkatGame& game, py::handle seed) {
+            game.reset_full(uint64_from_python_int(seed, "seed"));
+        }, py::arg("seed"))
+        .def("reset_full_from_deal", &skat_rl::FastSkatGame::reset_full_from_deal,
+             py::arg("hands"), py::arg("skat"), py::arg("forehand") = 0)
+        .def("phase", &skat_rl::FastSkatGame::phase)
+        .def("decision_threshold", &skat_rl::FastSkatGame::decision_threshold)
+        .def("winning_bid", &skat_rl::FastSkatGame::winning_bid)
         .def(
             "reset",
             [](skat_rl::FastSkatGame& game, py::handle seed) {
@@ -246,10 +271,11 @@ PYBIND11_MODULE(_skat_cpp, m) {
 
     py::class_<skat_rl::BatchedFastSkatEnv>(m, "BatchedFastSkatEnv")
         .def(
-            py::init<int, int, int>(),
+            py::init<int, int, int, bool>(),
             py::arg("size"),
             py::arg("learning_player"),
-            py::arg("fixed_declarer") = -1
+            py::arg("fixed_declarer") = -1,
+            py::arg("full_game") = false
         )
         .def(
             "reset",
@@ -285,7 +311,7 @@ PYBIND11_MODULE(_skat_cpp, m) {
             return bool_array(
                 env.active_action_masks(),
                 env.active_count(),
-                skat_rl::kNumCards
+                skat_rl::kNumActions
             );
         })
         .def("belief_targets", [](const skat_rl::BatchedFastSkatEnv& env) {

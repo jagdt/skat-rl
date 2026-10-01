@@ -13,8 +13,14 @@ from skat_rl.agents.ppo_agent import (  # noqa: E402
     observation_to_tensors,
 )
 from skat_rl.envs.observations import (
-    CardStatus, Contract, OBSERVATION_SPECS, empty_observations, index_observations,
+    CardStatus, Contract, Phase, OBSERVATION_SPECS, empty_observations as _empty_observations, index_observations,
 )
+
+
+def empty_observations(batch_shape=()):
+    observations = _empty_observations(batch_shape)
+    observations["phase"][...] = Phase.CARD_PLAY
+    return observations
 
 
 def test_masked_categorical_never_assigns_probability_to_illegal_actions():
@@ -182,7 +188,7 @@ def test_agent_save_and_load_round_trip(tmp_path):
 
 def _tiny_transformer_config(**overrides):
     values = {
-        "action_dim": 32,
+        "action_dim": 66,
         "architecture": "transformer",
         "use_belief": True,
         "transformer_dim": 32,
@@ -209,7 +215,7 @@ def test_tokenizer_uses_explicit_card_status_and_relative_players():
     observations["relative_current_leader"][:] = 2
     tensors = observation_to_tensors(observations, "cpu")
     tokens = tokenizer(tensors)
-    assert tokens.shape == (2, 33, 16)
+    assert tokens.shape == (2, 36, 16)
     torch.testing.assert_close(tokens[0], tokens[1])
 
     changed = {key: value.clone() for key, value in tensors.items()}
@@ -250,7 +256,7 @@ def test_tokenizer_projects_trick_index_and_numeric_state_with_documented_scale(
     tokens = tokenizer(observation_to_tensors(observations, "cpu"))
     trick_hook.remove()
     numeric_hook.remove()
-    assert tokens.shape == (2, 33, 16)
+    assert tokens.shape == (2, 36, 16)
     torch.testing.assert_close(inputs["trick_index"][:, 6, 0], torch.tensor([0., 1.]))
     torch.testing.assert_close(inputs["trick_index"][:, 6], inputs["trick_index"][:, 8])
     torch.testing.assert_close(inputs["numeric"], torch.tensor([[.5, .25, 0.], [1., 0., 1.]]))
@@ -292,7 +298,7 @@ def test_rollout_fields_stay_aligned_across_time_env_and_minibatch():
 def test_transformer_outputs_policy_value_and_card_beliefs():
     agent = PPOAgent(_tiny_transformer_config(), device="cpu")
     observations = empty_observations((2,))
-    action_masks = np.ones((2, 32), dtype=bool)
+    action_masks = np.ones((2, 66), dtype=bool)
 
     actions, log_probs, values = agent.get_action_and_value(observations, action_masks)
     beliefs = agent.get_belief_probabilities(observations)
@@ -312,14 +318,14 @@ def test_auxiliary_belief_does_not_feed_policy_or_value_heads():
     rollout_policy_logits, rollout_values, rollout_beliefs = model.outputs(
         observations, include_belief=False,
     )
-    assert policy_logits.shape == (2, 32)
+    assert policy_logits.shape == (2, 66)
     assert values.shape == (2,)
     assert belief_logits.shape == (2, 32, 3)
     assert rollout_beliefs is None
     assert torch.allclose(policy_logits, rollout_policy_logits)
     assert torch.allclose(values, rollout_values)
 
-    (policy_logits.sum() + values.sum()).backward()
+    (policy_logits[:, :32].sum() + values.sum()).backward()
     assert all(parameter.grad is None for parameter in model.belief_head.parameters())
 
     model.zero_grad()
@@ -337,7 +343,7 @@ def test_transformer_update_trains_belief_head_with_supervised_targets():
     rollout = RolloutBuffer(2, 1, config.action_dim, use_belief=True)
     observations = empty_observations((1,))
     masks = np.ones((1, config.action_dim), dtype=bool)
-    targets = np.arange(config.action_dim, dtype=np.int64)[None, :] % 3
+    targets = np.arange(32, dtype=np.int64)[None, :] % 3
 
     for step in range(2):
         actions, log_probs, values = agent.get_action_and_value(observations, masks)
@@ -418,7 +424,7 @@ def test_transformer_without_belief_updates_without_targets():
 
 
 def test_transformer_config_defaults_to_no_belief():
-    config = PPOConfig(action_dim=32, architecture="transformer",
+    config = PPOConfig(action_dim=66, architecture="transformer",
                        transformer_dim=32, transformer_layers=1, transformer_heads=4,
                        transformer_ff_dim=64)
     agent = PPOAgent(config, device="cpu")
@@ -437,3 +443,129 @@ def test_incompatible_transformer_checkpoint_has_clear_error(tmp_path):
 
     with pytest.raises(ValueError, match="Older transformer checkpoints cannot be resumed"):
         PPOAgent.load(path, device="cpu")
+
+
+def _all_phase_observations():
+    from skat_rl.engine.game import SkatGame
+    from skat_rl.envs.observations import build_observation, stack_observations
+
+    game = SkatGame()
+    game.reset(seed=17, full_game=True, forehand=0)
+    observations, masks = [], []
+    for phase in (Phase.BIDDING, Phase.PICKUP_DECISION, Phase.DISCARD,
+                  Phase.CONTRACT_SELECTION, Phase.CARD_PLAY):
+        assert game.state.phase == phase
+        observations.append(build_observation(game.state, game.state.current_player))
+        mask = np.zeros(66, dtype=bool)
+        mask[game.legal_actions()] = True
+        masks.append(mask)
+        if phase == Phase.BIDDING:
+            for action in (1, 0, 0):
+                game.step(action)
+        elif phase != Phase.CARD_PLAY:
+            game.step(0)
+    return observation_to_tensors(stack_observations(observations), "cpu"), torch.tensor(np.stack(masks))
+
+
+def test_mixed_phase_batch_encodes_once_and_dispatches_only_relevant_rows():
+    model = SkatTransformerActorCritic(_tiny_transformer_config())
+    observations, masks = _all_phase_observations()
+    seen = {}
+    modules = {name: getattr(model, name) for name in (
+        "encoder", "bid_head", "pickup_head", "discard_head", "contract_head", "policy_head", "value_head", "belief_head",
+    )}
+    handles = [module.register_forward_pre_hook(
+        lambda module, args, name=name: seen.setdefault(name, []).append(tuple(args[0].shape)))
+        for name, module in modules.items()]
+    actions, log_probs, entropy, values, beliefs = model(observations, masks, include_belief=False)
+    for handle in handles:
+        handle.remove()
+    assert seen["encoder"] == [(5, 36, 32)]
+    assert seen["bid_head"] == seen["pickup_head"] == [(1, 32)]
+    assert seen["discard_head"] == [(1, 66, 96)]
+    assert seen["contract_head"] == [(1, 6, 64)]
+    assert seen["policy_head"] == [(1, 32, 64)]
+    assert seen["value_head"] == [(5, 32)]
+    assert "belief_head" not in seen and beliefs is None
+    assert actions.shape == log_probs.shape == entropy.shape == values.shape == (5,)
+    assert masks[torch.arange(5), actions].all()
+    assert torch.isfinite(log_probs).all()
+
+
+@pytest.mark.parametrize("row,head", list(enumerate((
+    "bid_head", "pickup_head", "discard_head", "contract_head", "policy_head",
+))))
+def test_policy_gradient_updates_only_active_head_and_shared_encoder(row, head):
+    model = SkatTransformerActorCritic(_tiny_transformer_config())
+    observations, masks = _all_phase_observations()
+    observations = index_observations(observations, slice(row, row + 1))
+    calls = []
+    handles = [getattr(model, name).register_forward_hook(
+        lambda module, args, output, name=name: calls.append(name))
+        for name in ("bid_head", "pickup_head", "discard_head", "contract_head", "policy_head")]
+    _, log_probs, _, _, _ = model(observations, masks[row:row + 1], include_belief=False)
+    (-log_probs.mean()).backward()
+    for handle in handles:
+        handle.remove()
+    assert calls == [head]
+    for name in ("bid_head", "pickup_head", "discard_head", "contract_head", "policy_head", "value_head", "belief_head"):
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in getattr(model, name).parameters()) == (name == head)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoder.parameters())
+    if head == "contract_head":
+        assert model.tokenizer.contract_embedding.weight.grad.abs().sum() > 0
+    if head == "bid_head":
+        assert model.tokenizer.bid_value_embedding.weight.grad.abs().sum() > 0
+
+
+def test_belief_gradient_reaches_shared_encoder_but_no_policy_or_value_head():
+    model = SkatTransformerActorCritic(_tiny_transformer_config())
+    observations, _ = _all_phase_observations()
+    _, _, beliefs = model.outputs(observations)
+    assert beliefs.shape == (5, 32, 3)
+    torch.nn.functional.cross_entropy(beliefs.flatten(0, 1), torch.zeros(160, dtype=torch.long)).backward()
+    for name in ("bid_head", "pickup_head", "discard_head", "contract_head", "policy_head", "value_head"):
+        assert all(p.grad is None for p in getattr(model, name).parameters())
+    assert model.tokenizer.rank_embedding.weight.grad.abs().sum() > 0
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoder.parameters())
+
+
+def test_bid_info_uses_shared_bid_values_and_omits_absent_fields():
+    from skat_rl.engine.actions import BID_VALUES
+    from skat_rl.engine.state import AuctionRole
+
+    tokenizer = SkatObservationTokenizer(16)
+    observations = observation_to_tensors(_empty_observations((1,)), "cpu")
+    expected = (tokenizer.bid_info_token + tokenizer.player_embedding(tokenizer.relative_players)
+                + tokenizer.bidding_status_embedding(observations["bid_status"]))
+    torch.testing.assert_close(tokenizer.tokenize_bid_info(observations), expected)
+    embedding = tokenizer.bid_value_embedding.weight[BID_VALUES.index(22)]
+    for field, projection in (("highest_called", "called_projection"), ("highest_held", "held_projection"),
+                              ("pass_threshold", "pass_projection")):
+        changed = {key: value.clone() for key, value in observations.items()}
+        changed[field][0, 1] = 22
+        delta = tokenizer.tokenize_bid_info(changed) - expected
+        torch.testing.assert_close(delta[0, 1], getattr(tokenizer, projection)(embedding))
+        torch.testing.assert_close(delta[0, [0, 2]], torch.zeros(2, 16))
+    observations["pass_role"][0, 1] = AuctionRole.HOLDER
+    delta = tokenizer.tokenize_bid_info(observations) - expected
+    torch.testing.assert_close(delta[0, 1], tokenizer.pass_role_embedding.weight[AuctionRole.HOLDER])
+
+
+def test_discard_head_candidate_order_matches_engine_pair_actions():
+    from skat_rl.engine.actions import DISCARD_PAIRS
+
+    model = SkatTransformerActorCritic(_tiny_transformer_config())
+    cards = torch.arange(32).float()[None, :, None].expand(1, 32, 32)
+    state = torch.zeros(1, 32)
+    status = torch.zeros(1, 32, dtype=torch.long)
+    owned = [0, 2, 4, 6, 7, 9, 11, 14, 20, 25, 29, 31]
+    status[0, owned] = CardStatus.OWN
+    inputs = []
+    handle = model.discard_head.register_forward_pre_hook(lambda module, args: inputs.append(args[0]))
+    assert model.discard_logits(state, cards, status).shape == (1, 66)
+    handle.remove()
+    assert inputs[0][0, :, 32].tolist() == [owned[i] for i, _ in DISCARD_PAIRS]
+    assert inputs[0][0, :, 64].tolist() == [owned[j] for _, j in DISCARD_PAIRS]
+    status[0, 0] = CardStatus.UNKNOWN
+    with pytest.raises(ValueError, match="12 OWN"):
+        model.discard_logits(state, cards, status)

@@ -17,6 +17,8 @@ from skat_rl.envs.skat_cpp_batched_env import SkatCppBatchedSingleAgentEnv
 
 def main():
     args = _parse_args()
+    if not args.card_play_only and args.fixed_declarer not in (None, -1):
+        raise ValueError("--fixed-declarer requires --card-play-only.")
     if args.architecture == "mlp" and args.use_belief:
         raise ValueError("--belief requires --architecture transformer.")
     if args.opponent_model is not None and args.env != "cpp":
@@ -42,6 +44,7 @@ def main():
             learning_player=args.learning_player,
             fixed_declarer=args.fixed_declarer,
             seed=args.seed,
+            full_game=not args.card_play_only,
         )
     else:
         envs = [
@@ -519,8 +522,9 @@ def _parse_args():
     parser.add_argument("--n-envs", type=int, default=6)
     parser.add_argument("--rollout-size", type=int, default=2000)
     parser.add_argument("--learning-player", type=int, default=0)
+    parser.add_argument("--card-play-only", action="store_true", help="Skip bidding and setup; train only card play.")
     parser.add_argument("--fixed-declarer", type=int, choices=[-1, 0, 1, 2], default=None,
-                        help="0/1/2: fixed seat. Default (or -1): heuristic declarer selection.")
+                        help="Card-play-only mode: fixed seat, or heuristic selection with -1/default.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--env", choices=["python", "cpp"], default="cpp")
     parser.add_argument("--output-dir", default="models")
@@ -560,8 +564,9 @@ def _parse_args():
 def _make_env(args, env_index):
     return SkatSingleAgentEnv(
         learning_player=args.learning_player,
-        fixed_declarer=args.fixed_declarer,
+        fixed_declarer=None if args.fixed_declarer == -1 else args.fixed_declarer,
         seed=_env_seed(args.seed, env_index),
+        full_game=not args.card_play_only,
     )
 
 

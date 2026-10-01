@@ -60,8 +60,8 @@ def test_complete_public_history_and_current_trick_are_preserved(game_type):
             obs = build_observation(state, player)
             assert space.contains(obs)
             assert set(obs) == set(OBSERVATION_SPECS)
-            assert obs["phase"] == (Phase.TERMINAL if move == 30 else Phase.CARD_PLAY)
-            assert obs["current_trick"] == min(move // 3, 9)
+            assert obs["phase"] == (Phase.TERMINAL if state.terminated else Phase.CARD_PLAY)
+            assert obs["current_trick"] == max(0, move // 3 - int(state.terminated))
             played = obs["card_status"] == CardStatus.PLAYED
             own = obs["card_status"] == CardStatus.OWN
             assert int(played.sum()) == move
@@ -82,16 +82,20 @@ def test_complete_public_history_and_current_trick_are_preserved(game_type):
             assert obs["defender_points"] == sum(points_won_by_player(state.won_cards, p)
                                                   for p in range(3) if p != state.declarer)
             np.testing.assert_array_equal(obs["void_info"], reconstruct_voids(obs))
-        if move < 30:
-            game.step(rng.choice(game.legal_actions()))
+        if state.terminated:
+            break
+        game.step(rng.choice(game.legal_actions()))
 
 
 def rotate_seats(state, shift):
     rotated = deepcopy(state)
-    for field in ("hands", "won_cards"):
+    for field in ("hands", "won_cards", "bid_status", "highest_called", "highest_held", "pass_threshold", "pass_role"):
         original = getattr(state, field)
         setattr(rotated, field, [deepcopy(original[(p - shift) % 3]) for p in range(3)])
-    rotated.declarer = (state.declarer + shift) % 3
+    rotated.declarer = (state.declarer + shift) % 3 if state.declarer >= 0 else -1
+    rotated.forehand = (state.forehand + shift) % 3
+    rotated.auction_caller = (state.auction_caller + shift) % 3
+    rotated.auction_holder = (state.auction_holder + shift) % 3
     rotated.current_player = (state.current_player + shift) % 3
     rotated.trick_winners = [(p + shift) % 3 for p in state.trick_winners]
     # A terminal current trick aliases the last completed trick in the engine.
@@ -118,6 +122,19 @@ def test_rotated_absolute_seats_produce_identical_observations_and_tokens(shift)
     tokenizer = SkatObservationTokenizer(16)
     tokens = tokenizer(observation_to_tensors(stack_observations([original, other]), "cpu"))
     torch.testing.assert_close(tokens[0], tokens[1])
+
+
+@pytest.mark.parametrize("steps", [0, 2, 4, 5, 6, 7])
+def test_full_game_observations_are_rotation_invariant(steps):
+    game = SkatGame()
+    game.reset(seed=31, full_game=True, forehand=0)
+    for action in [1, 1, 0, 0, 0, 0, 0][:steps]:
+        game.step(action)
+    player = game.state.current_player
+    original = build_observation(game.state, player)
+    for shift in (1, 2):
+        other = build_observation(rotate_seats(game.state, shift), (player + shift) % 3)
+        assert_equal(original, other)
 
 
 @pytest.mark.parametrize("player", [0, 1, 2])
@@ -171,10 +188,10 @@ def test_empty_batches_keep_field_shapes_and_compact_integer_storage():
     batch = stack_observations([])
     for field, (shape, _, _) in OBSERVATION_SPECS.items():
         assert batch[field].shape == (0,) + shape
-        assert batch[field].dtype == np.int8
+        assert batch[field].dtype == np.int16
     game = SkatGame()
     obs = build_observation(game.reset(seed=1), 0)
-    assert sum(value.nbytes for value in obs.values()) == 150
+    assert sum(value.nbytes for value in obs.values()) == 340
     batch = stack_observations([obs, obs])
     assert_equal(index_observations(batch, 1), obs)
     assert_equal(index_observations(batch, np.array([1, 0])), batch)

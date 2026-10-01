@@ -10,6 +10,8 @@ from torch.distributions import Categorical
 from torch.nn import functional as F
 
 from skat_rl.engine.cards import Rank, Suit
+from skat_rl.engine.actions import BID_VALUES, DISCARD_PAIRS, NUM_ACTIONS
+from skat_rl.engine.state import AuctionRole, BiddingStatus, Seat
 from skat_rl.envs.observations import (
     OBSERVATION_SPECS, NUM_CARDS, NUM_TRICKS,
     CardStatus, Contract, Phase, RelativePlayer, TrickSlot,
@@ -19,7 +21,7 @@ from skat_rl.envs.observations import (
 
 @dataclass
 class PPOConfig:
-    action_dim: int = NUM_CARDS
+    action_dim: int = NUM_ACTIONS
     architecture: str = "mlp"
     use_belief: bool = False
     hidden_sizes: tuple[int, ...] = (256, 256)
@@ -86,7 +88,7 @@ class MaskedActorCritic(nn.Module):
 
 
 class SkatObservationTokenizer(nn.Module):
-    """Embed explicit public fields into one STATE and 32 persistent CARD tokens."""
+    """One STATE, 32 physical CARDs, and three relative BID_INFO tokens."""
 
     num_cards = NUM_CARDS
 
@@ -102,6 +104,17 @@ class SkatObservationTokenizer(nn.Module):
         self.state_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         self.phase_embedding = nn.Embedding(len(Phase), model_dim)
         self.contract_embedding = nn.Embedding(len(Contract), model_dim)
+        self.seat_embedding = nn.Embedding(len(Seat), model_dim)
+        self.auction_role_embedding = nn.Embedding(len(AuctionRole), model_dim)
+        self.hand_embedding = nn.Embedding(2, model_dim)
+        self.bid_info_token = nn.Parameter(torch.zeros(1, 1, model_dim))
+        self.bidding_status_embedding = nn.Embedding(len(BiddingStatus), model_dim)
+        self.bid_value_embedding = nn.Embedding(len(BID_VALUES), model_dim)
+        self.called_projection = nn.Linear(model_dim, model_dim, bias=False)
+        self.held_projection = nn.Linear(model_dim, model_dim, bias=False)
+        self.pass_projection = nn.Linear(model_dim, model_dim, bias=False)
+        self.decision_projection = nn.Linear(model_dim, model_dim, bias=False)
+        self.pass_role_embedding = nn.Embedding(len(AuctionRole), model_dim)
         self.declarer_projection = nn.Linear(model_dim, model_dim, bias=False)
         self.leader_projection = nn.Linear(model_dim, model_dim, bias=False)
         self.numeric_state_projection = nn.Linear(3, model_dim, bias=False)
@@ -110,6 +123,15 @@ class SkatObservationTokenizer(nn.Module):
         self.register_buffer("card_ranks", card_ids % len(Rank), persistent=False)
         self.register_buffer("card_suits", card_ids // len(Rank), persistent=False)
         self.register_buffer("effective_suits", torch.as_tensor(effective_suit_table()), persistent=False)
+        self.register_buffer("relative_players", torch.arange(len(RelativePlayer)), persistent=False)
+        bid_ids = torch.zeros(max(BID_VALUES) + 1, dtype=torch.long)
+        bid_ids[torch.tensor(BID_VALUES)] = torch.arange(len(BID_VALUES))
+        self.register_buffer("bid_ids", bid_ids, persistent=False)
+
+    def bid_feature(self, values, projection):
+        present = values > 0
+        ids = self.bid_ids[values.clamp_min(0)]
+        return projection(self.bid_value_embedding(ids)) * present.unsqueeze(-1)
 
     def tokenize_cards(self, observation):
         status = observation["card_status"]
@@ -117,9 +139,11 @@ class SkatObservationTokenizer(nn.Module):
         card_tokens = (
             self.rank_embedding(self.card_ranks)
             + self.suit_embedding(self.card_suits)
-            + self.effective_suit_embedding(self.effective_suits[observation["contract"]])
             + self.card_status_embedding(status)
         )
+        contract = observation["contract"]
+        effective = self.effective_suit_embedding(self.effective_suits[contract.clamp_min(0)])
+        card_tokens = card_tokens + effective * (contract >= 0)[:, None, None]
         # Sentinels never enter an embedding or contribute to an unplayed token.
         played_by = torch.where(played, observation["played_by"], 0)
         trick_indices = torch.where(played, observation["trick_index"], 0).float() / (NUM_TRICKS - 1)
@@ -137,13 +161,42 @@ class SkatObservationTokenizer(nn.Module):
             observation["defender_points"].float() / 120.0,
             observation["current_trick"].float() / (NUM_TRICKS - 1),
         ], dim=-1)
-        return (
+        phase = observation["phase"]
+        bidding = phase == Phase.BIDDING
+        card_play = (phase == Phase.CARD_PLAY) | (phase == Phase.TERMINAL)
+        contract = observation["contract"]
+        declarer = observation["relative_declarer"]
+        leader = observation["relative_current_leader"]
+        hand_game = observation["hand_game"]
+        state = (
             self.state_token[:, 0]
-            + self.phase_embedding(observation["phase"])
-            + self.contract_embedding(observation["contract"])
-            + self.declarer_projection(self.player_embedding(observation["relative_declarer"]))
-            + self.leader_projection(self.player_embedding(observation["relative_current_leader"]))
+            + self.phase_embedding(phase)
+            + self.contract_embedding(contract.clamp_min(0)) * (contract >= 0).unsqueeze(-1)
+            + self.declarer_projection(self.player_embedding(declarer.clamp_min(0))) * (declarer >= 0).unsqueeze(-1)
+            + self.hand_embedding(hand_game.clamp_min(0)) * (hand_game >= 0).unsqueeze(-1)
+            + self.bid_feature(observation["winning_bid"], self.decision_projection) * (~bidding).unsqueeze(-1)
+        )
+        bidding_features = (
+            self.seat_embedding(observation["seat"])
+            + self.auction_role_embedding(observation["auction_role"].clamp_min(0))
+            + self.bid_feature(observation["decision_threshold"], self.decision_projection)
+        )
+        play_features = (
+            self.leader_projection(self.player_embedding(leader.clamp_min(0))) * (leader >= 0).unsqueeze(-1)
             + self.numeric_state_projection(numeric)
+        )
+        return state + bidding_features * bidding.unsqueeze(-1) + play_features * card_play.unsqueeze(-1)
+
+    def tokenize_bid_info(self, observation):
+        roles = observation["pass_role"]
+        return (
+            self.bid_info_token
+            + self.player_embedding(self.relative_players)
+            + self.bidding_status_embedding(observation["bid_status"])
+            + self.bid_feature(observation["highest_called"], self.called_projection)
+            + self.bid_feature(observation["highest_held"], self.held_projection)
+            + self.bid_feature(observation["pass_threshold"], self.pass_projection)
+            + self.pass_role_embedding(roles.clamp_min(0)) * (roles >= 0).unsqueeze(-1)
         )
 
     def forward(self, observations):
@@ -151,7 +204,8 @@ class SkatObservationTokenizer(nn.Module):
         # the transformer can infer it from the complete per-card play history.
         state = self.tokenize_state(observations)
         cards = self.tokenize_cards(observations)
-        return self.output_norm(torch.cat([state.unsqueeze(1), cards], dim=1))
+        bids = self.tokenize_bid_info(observations)
+        return self.output_norm(torch.cat([state.unsqueeze(1), cards, bids], dim=1))
 
 
 class SkatTransformerActorCritic(nn.Module):
@@ -166,8 +220,8 @@ class SkatTransformerActorCritic(nn.Module):
 
     def __init__(self, config: PPOConfig):
         super().__init__()
-        if config.action_dim != SkatObservationTokenizer.num_cards:
-            raise ValueError("The Skat transformer requires one action per card (32 actions).")
+        if config.action_dim != NUM_ACTIONS:
+            raise ValueError(f"The full-game Skat transformer requires {NUM_ACTIONS} action slots.")
         if config.transformer_heads < 1:
             raise ValueError("transformer_heads must be at least 1.")
         if config.transformer_dim % config.transformer_heads != 0:
@@ -199,7 +253,12 @@ class SkatTransformerActorCritic(nn.Module):
         # [global STATE representation, contextual CARD representation].
         per_card_input_dim = model_dim * 2
         self.policy_head = _head(per_card_input_dim, model_dim, 1, 0.01)
+        self.bid_head = _head(model_dim, model_dim, 2, 0.01)
+        self.pickup_head = _head(model_dim, model_dim, 2, 0.01)
+        self.contract_head = _head(2 * model_dim, model_dim, 1, 0.01)
+        self.discard_head = _head(3 * model_dim, model_dim, 1, 0.01)
         self.value_head = _head(model_dim, model_dim, 1, 1.0)
+        self.register_buffer("discard_pairs", torch.tensor(DISCARD_PAIRS), persistent=False)
 
         if self.use_belief:
             self.belief_head = _head(
@@ -217,7 +276,25 @@ class SkatTransformerActorCritic(nn.Module):
         state_per_card = state.unsqueeze(1).expand(-1, cards.shape[1], -1)
         per_card_features = torch.cat([state_per_card, cards], dim=-1)
 
-        policy_logits = self.policy_head(per_card_features).squeeze(-1)
+        policy_logits = state.new_full((len(state), NUM_ACTIONS), torch.finfo(state.dtype).min)
+        for phase in (Phase.BIDDING, Phase.PICKUP_DECISION, Phase.DISCARD,
+                      Phase.CONTRACT_SELECTION, Phase.CARD_PLAY):
+            rows = torch.nonzero(observations["phase"] == phase, as_tuple=True)[0]
+            if not rows.numel():
+                continue
+            if phase == Phase.BIDDING:
+                logits = self.bid_head(state[rows])
+            elif phase == Phase.PICKUP_DECISION:
+                logits = self.pickup_head(state[rows])
+            elif phase == Phase.CONTRACT_SELECTION:
+                contracts = self.tokenizer.contract_embedding.weight.unsqueeze(0).expand(len(rows), -1, -1)
+                candidates = torch.cat([state[rows, None].expand(-1, len(Contract), -1), contracts], dim=-1)
+                logits = self.contract_head(candidates).squeeze(-1)
+            elif phase == Phase.DISCARD:
+                logits = self.discard_logits(state[rows], cards[rows], observations["card_status"][rows])
+            else:
+                logits = self.policy_head(per_card_features[rows]).squeeze(-1)
+            policy_logits[rows, :logits.shape[1]] = logits
         values = self.value_head(state).squeeze(-1)
         belief_logits = (
             self.belief_head(per_card_features)
@@ -226,6 +303,19 @@ class SkatTransformerActorCritic(nn.Module):
         )
 
         return policy_logits, values, belief_logits
+
+    def discard_logits(self, state, cards, status):
+        if not ((status == CardStatus.OWN).sum(-1) == 12).all():
+            raise ValueError("Discard observations must contain exactly 12 OWN cards.")
+        card_ids = torch.arange(NUM_CARDS, device=cards.device).expand(len(cards), -1)
+        owned = card_ids.masked_fill(status != CardStatus.OWN, NUM_CARDS).sort(dim=-1).values[:, :12]
+        pair_cards = owned[:, self.discard_pairs]
+        rows = torch.arange(len(cards), device=cards.device)[:, None]
+        candidates = torch.cat([
+            state[:, None].expand(-1, NUM_ACTIONS, -1),
+            cards[rows, pair_cards[:, :, 0]], cards[rows, pair_cards[:, :, 1]],
+        ], dim=-1)
+        return self.discard_head(candidates).squeeze(-1)
 
     def forward(self, observations, action_masks=None, actions=None, include_belief=True):
         logits, values, belief_logits = self.outputs(observations, include_belief)
@@ -243,8 +333,8 @@ class SkatTransformerActorCritic(nn.Module):
         )
 
     def value(self, observations):
-        _, values, _ = self.outputs(observations, include_belief=False)
-        return values
+        state = self.encoder(self.tokenizer(observations))[:, 0]
+        return self.value_head(state).squeeze(-1)
 
     def policy_logits(self, observations):
         logits, _, _ = self.outputs(observations, include_belief=False)
@@ -474,7 +564,7 @@ class RolloutBuffer:
         self.values = np.zeros(shape, dtype=np.float32)
         self.action_masks = np.zeros(shape + (action_dim,), dtype=bool)
         self.belief_targets = (
-            np.full(shape + (action_dim,), -1, dtype=np.int64) if use_belief else None
+            np.full(shape + (NUM_CARDS,), -1, dtype=np.int64) if use_belief else None
         )
         self.advantages = np.zeros(shape, dtype=np.float32)
         self.returns = np.zeros(shape, dtype=np.float32)
