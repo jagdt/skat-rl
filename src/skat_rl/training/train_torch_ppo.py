@@ -517,10 +517,10 @@ def load_frozen_opponent(path, learner_config, device=None):
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Train masked PPO from scratch with PyTorch.")
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
-    parser.add_argument("--rollout-steps", type=int, default=2048)
+    parser.add_argument("--total-timesteps", type=int, default=10_000_000)
+    parser.add_argument("--rollout-steps", type=int, default=8192)
     parser.add_argument("--n-envs", type=int, default=6)
-    parser.add_argument("--rollout-size", type=int, default=2000)
+    parser.add_argument("--rollout-size", type=int, default=10000)
     parser.add_argument("--learning-player", type=int, default=0)
     parser.add_argument("--card-play-only", action="store_true", help="Skip bidding and setup; train only card play.")
     parser.add_argument("--fixed-declarer", type=int, choices=[-1, 0, 1, 2], default=None,
@@ -539,7 +539,7 @@ def _parse_args():
                         help="Train an auxiliary supervised hidden-card belief head.")
     parser.set_defaults(use_belief=False)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 512, 512, 512])
-    parser.add_argument("--activation", choices=["tanh", "relu", "gelu"], default="tanh")
+    parser.add_argument("--activation", choices=["tanh", "relu", "gelu"], default="gelu")
     parser.add_argument("--transformer-dim", type=int, default=256)
     parser.add_argument("--transformer-layers", type=int, default=4)
     parser.add_argument("--transformer-heads", type=int, default=8)
