@@ -153,7 +153,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", help="Chronologically ordered .sgf or .sgf.bz2 files.")
     parser.add_argument("--output-dir", required=True, help="New directory for prepared shards.")
-    parser.add_argument("--min-rating", type=float, default=1000)
+    parser.add_argument("--min-rating", type=float, default=900)
     parser.add_argument("--min-prior-games", type=int, default=0)
     parser.add_argument("--role", choices=["both", "declarer", "defender"], default="both")
     parser.add_argument("--game-kinds", nargs="+", choices=["suit", "grand", "null"], default=["suit", "grand", "null"])
